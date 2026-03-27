@@ -9,7 +9,7 @@
 
 import asyncio
 import aiohttp
-import aiofiles                     # pip install aiofiles
+import aiofiles
 import random
 import re
 import os
@@ -57,16 +57,14 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 ENGINES   = ["bing", "yahoo"]
 MAX_PAGES = 70
 
-# New queue sizes – tunable
-INPUT_QUEUE_SIZE  = 2000          # dorks waiting to be processed
-OUTPUT_QUEUE_SIZE = 5000          # results waiting to be written
+INPUT_QUEUE_SIZE  = 2000
+OUTPUT_QUEUE_SIZE = 5000
 
-# ─── RELIABILITY CONSTANTS ──────────────────────────────────────────────────
-WORKER_FETCH_TIMEOUT = 120          # seconds per multi-page fetch
-WATCHDOG_INTERVAL    = 30           # seconds between watchdog checks
-WATCHDOG_STALL_LIMIT = 90           # seconds without result before restart
-SESSION_RESET_THRESHOLD = 8         # consecutive zero-raw dorks before session recycle
-JOB_TIMEOUT          = 30 * 60      # 30 minutes total job runtime
+WORKER_FETCH_TIMEOUT = 120
+WATCHDOG_INTERVAL    = 30
+WATCHDOG_STALL_LIMIT = 90
+SESSION_RESET_THRESHOLD = 8
+JOB_TIMEOUT          = 30 * 60
 
 DEFAULT_SESSION = {
     "workers": WORKERS,
@@ -80,7 +78,6 @@ DEFAULT_SESSION = {
 user_sessions: dict = {}
 active_jobs:   dict = {}
 
-# ─── SHARED CONNECTOR ───────────────────────────────────────────────────────
 SHARED_CONNECTOR = aiohttp.TCPConnector(
     ssl=False,
     limit=100,
@@ -88,7 +85,6 @@ SHARED_CONNECTOR = aiohttp.TCPConnector(
     ttl_dns_cache=300,
 )
 
-# ─── TOR ROTATION ──────────────────────────────────────────────────────────
 tor_rotation_task = None
 tor_enabled_users = 0
 
@@ -370,7 +366,6 @@ async def fetch_page_yahoo(session: aiohttp.ClientSession, dork: str, page: int,
         return []
 
 
-# ─── FETCH ALL PAGES ─────────────────────────────────────────────────────────
 async def fetch_all_pages(session: aiohttp.ClientSession, dork: str, engine: str,
                           pages: list, max_res: int) -> list:
     all_urls: list = []
@@ -398,7 +393,6 @@ async def fetch_all_pages(session: aiohttp.ClientSession, dork: str, engine: str
     return all_urls
 
 
-# ─── WORKER ──────────────────────────────────────────────────────────────────
 async def dork_worker(wid: int,
                       input_q: asyncio.Queue,
                       results_q: asyncio.Queue,
@@ -408,10 +402,6 @@ async def dork_worker(wid: int,
                       session: aiohttp.ClientSession,
                       min_score: int,
                       stop_ev: asyncio.Event):
-    """
-    Pull dork from input_q, fetch results, push to results_q.
-    Exits when stop_ev is set or when it receives None.
-    """
     eidx = wid % len(engines)
     while not stop_ev.is_set():
         try:
@@ -419,7 +409,7 @@ async def dork_worker(wid: int,
         except asyncio.TimeoutError:
             continue
 
-        if dork is None:          # sentinel – no more dorks
+        if dork is None:
             input_q.task_done()
             break
 
@@ -444,11 +434,9 @@ async def dork_worker(wid: int,
         scored = filter_scored(raw, min_score)
         log.info(f"[W{wid}] raw={len(raw)} kept={len(scored)}")
 
-        # Put result into the results queue
         try:
             results_q.put_nowait((dork, engine, pages, scored, len(raw)))
         except asyncio.QueueFull:
-            # If queue is full, wait for it to drain (shouldn't happen often)
             await results_q.put((dork, engine, pages, scored, len(raw)))
 
         input_q.task_done()
@@ -459,21 +447,15 @@ async def dork_worker(wid: int,
         await asyncio.sleep(delay)
 
 
-# ─── PRODUCER (reads dorks from file or list) ───────────────────────────────
 async def producer(input_q: asyncio.Queue,
                    dork_source: Union[List[str], str],
                    stop_ev: asyncio.Event):
-    """
-    Reads dorks from source and puts them into input_q.
-    Stops when stop_ev is set.
-    """
     if isinstance(dork_source, list):
         for dork in dork_source:
             if stop_ev.is_set():
                 break
             await input_q.put(dork)
     else:
-        # It's a file path
         try:
             async with aiofiles.open(dork_source, 'r', encoding='utf-8') as f:
                 async for line in f:
@@ -484,29 +466,22 @@ async def producer(input_q: asyncio.Queue,
                         await input_q.put(dork)
         except Exception as e:
             log.error(f"Producer failed to read file {dork_source}: {e}")
-            # We can't recover, so signal stop
             stop_ev.set()
-    # Signal workers that no more dorks are coming
     for _ in range(INPUT_QUEUE_SIZE):
         await input_q.put(None)
     log.info("Producer finished.")
 
 
-# ─── CONSUMER (writes results to disk) ──────────────────────────────────────
 async def consumer(results_q: asyncio.Queue,
                    tmp_path: str,
                    seen_urls: set,
                    batch_buffer: list,
                    total_dorks: int,
-                   processed: list,        # mutable list for count
-                   total_raw: list,        # mutable list for raw count
+                   processed: list,
+                   total_raw: list,
                    stop_ev: asyncio.Event,
                    context, chat_id, status_msg, start_time,
                    batch_size: int = 1000):
-    """
-    Reads results from results_q, deduplicates, writes to file, updates progress.
-    Exits when stop_ev is set and queue is empty.
-    """
     flush_lock = asyncio.Lock()
 
     async def flush_buffer():
@@ -515,7 +490,6 @@ async def consumer(results_q: asyncio.Queue,
             return
         async with flush_lock:
             async with aiofiles.open(tmp_path, 'a', encoding='utf-8') as f:
-                # Group by score
                 high = [u for sc, u in batch_buffer if sc >= 70]
                 medium = [u for sc, u in batch_buffer if 40 <= sc < 70]
                 low = [u for sc, u in batch_buffer if sc < 40]
@@ -545,7 +519,6 @@ async def consumer(results_q: asyncio.Queue,
         processed[0] += 1
         total_raw[0] += raw_count
 
-        # Deduplicate and write
         for sc, url in scored:
             if url not in seen_urls:
                 seen_urls.add(url)
@@ -553,7 +526,6 @@ async def consumer(results_q: asyncio.Queue,
                 if len(batch_buffer) >= batch_size:
                     await flush_buffer()
 
-        # Update status message periodically
         now = time.time()
         if now - last_edit > 4:
             pct = int(processed[0] / total_dorks * 100)
@@ -580,19 +552,14 @@ async def consumer(results_q: asyncio.Queue,
 
         results_q.task_done()
 
-    # Final flush
     await flush_buffer()
     log.info("Consumer finished.")
 
 
-# ─── JOB RUNNER (refactored) ────────────────────────────────────────────────
 async def run_dork_job(chat_id: int,
                        dork_source: Union[List[str], str],
                        total_dorks: int,
                        context):
-    """
-    Main job controller with streaming producer, bounded queues, and incremental file writing.
-    """
     sess = get_session(chat_id)
     engines = sess.get("engines", list(ENGINES))
     workers_n = sess.get("workers", WORKERS)
@@ -601,23 +568,19 @@ async def run_dork_job(chat_id: int,
     use_tor = sess.get("tor", False)
     min_score = sess.get("min_score", 30)
 
-    # Per-job session
     job_session, _ = _make_job_session(use_tor)
-    job_session_ref = [job_session]  # mutable for watchdog
+    job_session_ref = [job_session]
 
-    # Bounded queues
     input_q = asyncio.Queue(maxsize=INPUT_QUEUE_SIZE)
     results_q = asyncio.Queue(maxsize=OUTPUT_QUEUE_SIZE)
 
     stop_ev = asyncio.Event()
 
-    # Temporary file for incremental writing
     tmp_file = tempfile.NamedTemporaryFile(
         mode='w', encoding='utf-8', delete=False,
         prefix=f"dork_{chat_id}_", suffix='.txt'
     )
     tmp_path = tmp_file.name
-    # Write header
     with open(tmp_path, 'w', encoding='utf-8') as f:
         f.write(f"# Dork Parser v17.0 — SQL Targeted Results\n")
         f.write(f"# Date  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -625,11 +588,10 @@ async def run_dork_job(chat_id: int,
         f.write(f"# Filter: SQL ≥{min_score}\n")
         f.write("─" * 60 + "\n\n")
 
-    # Shared mutable state for progress
     seen_urls = set()
     batch_buffer = []
-    processed = [0]               # mutable list to pass by reference
-    total_raw = [0]               # mutable list for raw URLs
+    processed = [0]
+    total_raw = [0]
 
     start_time = time.time()
     pages_str = ", ".join(str(p) for p in pages)
@@ -647,7 +609,6 @@ async def run_dork_job(chat_id: int,
         f"{'━'*30}\n⏳ Starting..."
     )
 
-    # Helper to flush batch buffer (used by watchdog)
     async def flush_buffer():
         nonlocal batch_buffer
         if not batch_buffer:
@@ -672,7 +633,6 @@ async def run_dork_job(chat_id: int,
                 await f.write("\n")
             batch_buffer.clear()
 
-    # Worker tasks
     worker_tasks = []
     for i in range(workers_n):
         t = asyncio.create_task(
@@ -681,17 +641,14 @@ async def run_dork_job(chat_id: int,
         )
         worker_tasks.append(t)
 
-    # Producer task
     producer_task = asyncio.create_task(producer(input_q, dork_source, stop_ev))
 
-    # Consumer task
     consumer_task = asyncio.create_task(
         consumer(results_q, tmp_path, seen_urls, batch_buffer,
                  total_dorks, processed, total_raw, stop_ev, context, chat_id,
                  status_msg, start_time)
     )
 
-    # Watchdog
     last_result_ts = [time.time()]
     consecutive_zero_raw = 0
     restarts_without_progress = 0
@@ -709,7 +666,6 @@ async def run_dork_job(chat_id: int,
                 continue
 
             log.warning(f"[WATCHDOG][{chat_id}] Stall: no result for {elapsed:.0f}s")
-            # Cancel all workers
             for t in worker_tasks:
                 if not t.done():
                     t.cancel()
@@ -719,14 +675,12 @@ async def run_dork_job(chat_id: int,
             if stop_ev.is_set():
                 break
 
-            # Check if we should restart
             restarts_without_progress += 1
             if restarts_without_progress > max_restarts:
                 log.critical(f"[WATCHDOG][{chat_id}] Too many restarts, aborting job")
                 stop_ev.set()
                 break
 
-            # Restart workers
             log.info(f"[WATCHDOG][{chat_id}] Restarting {workers_n} workers")
             for i in range(workers_n):
                 t = asyncio.create_task(
@@ -739,7 +693,6 @@ async def run_dork_job(chat_id: int,
 
     watchdog_task = asyncio.create_task(watchdog())
 
-    # Global timeout
     async def job_timeout():
         await asyncio.sleep(JOB_TIMEOUT)
         log.warning(f"[JOB][{chat_id}] Global timeout ({JOB_TIMEOUT}s) reached")
@@ -747,26 +700,54 @@ async def run_dork_job(chat_id: int,
 
     timeout_task = asyncio.create_task(job_timeout())
 
+    async def send_results():
+        await flush_buffer()
+        elapsed = int(time.time() - start_time)
+        unique_cnt = len(seen_urls)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                text=(
+                    f"🏁 JOB COMPLETE!\n"
+                    f"{'━'*30}\n"
+                    f"📋 Dorks   : {total_dorks}\n"
+                    f"📄 Pages   : {pages_str}\n"
+                    f"🎯 SQL     : {unique_cnt} URLs\n"
+                    f"⏱ Time    : {elapsed}s\n"
+                    f"{'━'*30}"
+                )
+            )
+        except Exception:
+            pass
+
+        if seen_urls:
+            with open(tmp_path, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id, f,
+                    filename=f"sql_{total_dorks}dorks_{unique_cnt}urls.txt",
+                    caption=(
+                        f"📁 SQL Targets\n"
+                        f"🎯 {unique_cnt} unique URLs\n"
+                        f"📋 {total_dorks} dorks | Pages: {pages_str}"
+                    )
+                )
+        os.unlink(tmp_path)
+
     try:
-        # Wait for producer to finish (it will exit when all dorks are queued)
         await producer_task
-
-        # Wait for all workers to finish (they will exit when input_q is empty and stop_ev is set)
         await asyncio.gather(*worker_tasks, return_exceptions=True)
-
-        # Wait for consumer to finish
         await consumer_task
-
+        await send_results()
     except asyncio.CancelledError:
         log.info(f"[JOB] Cancelled for {chat_id}")
         stop_ev.set()
-        # Cancel remaining tasks
         for t in worker_tasks:
             t.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
         consumer_task.cancel()
         await asyncio.gather(consumer_task, return_exceptions=True)
-        raise
+        await send_results()
     finally:
         timeout_task.cancel()
         watchdog_task.cancel()
@@ -774,44 +755,8 @@ async def run_dork_job(chat_id: int,
         await job_session_ref[0].close()
         active_jobs.pop(chat_id, None)
 
-    # Job finished normally
-    elapsed = int(time.time() - start_time)
-    unique_cnt = len(seen_urls)
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg.message_id,
-            text=(
-                f"🏁 JOB COMPLETE!\n"
-                f"{'━'*30}\n"
-                f"📋 Dorks   : {total_dorks}\n"
-                f"📄 Pages   : {pages_str}\n"
-                f"🎯 SQL     : {unique_cnt} URLs\n"
-                f"⏱ Time    : {elapsed}s\n"
-                f"{'━'*30}"
-            )
-        )
-    except Exception:
-        pass
 
-    if seen_urls:
-        # Send the file
-        with open(tmp_path, 'rb') as f:
-            await context.bot.send_document(
-                chat_id, f,
-                filename=f"sql_{total_dorks}dorks_{unique_cnt}urls.txt",
-                caption=(
-                    f"📁 SQL Targets\n"
-                    f"🎯 {unique_cnt} unique URLs\n"
-                    f"📋 {total_dorks} dorks | Pages: {pages_str}"
-                )
-            )
-    os.unlink(tmp_path)
-
-
-# ─── SESSION FACTORY ─────────────────────────────────────────────────────────
 def _make_job_session(use_tor: bool):
-    """Return (session, connector_owned)."""
     if use_tor:
         try:
             from aiohttp_socks import ProxyConnector
@@ -822,7 +767,6 @@ def _make_job_session(use_tor: bool):
     return aiohttp.ClientSession(connector=SHARED_CONNECTOR, connector_owner=False), False
 
 
-# ─── UI HELPERS ────────────────────────────────────────────────────────────
 def get_session(chat_id: int) -> dict:
     if chat_id not in user_sessions:
         user_sessions[chat_id] = dict(DEFAULT_SESSION)
@@ -848,7 +792,6 @@ def page_keyboard(selected: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ─── COMMAND HANDLERS ───────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📂 Bulk Upload",  callback_data="m_bulk"),
@@ -892,7 +835,6 @@ async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📄 Pages: {', '.join(str(p) for p in s.get('pages',[1]))}"
         f"{'  🧅TOR' if s.get('tor') else ''}"
     )
-    # Single dork as list
     active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], 1, context))
 
 async def cmd_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1019,7 +961,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Job RUNNING" if job and not job.done() else "💤 No active job"
     )
 
-# ─── DOCUMENT & TEXT HANDLERS ───────────────────────────────────────────────
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     doc     = update.message.document
@@ -1030,7 +971,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Send a .txt file (one dork per line).")
         return
 
-    # Download file directly to a temporary file (streaming)
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
     tmp_path = tmp_file.name
     tmp_file.close()
@@ -1042,7 +982,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.unlink(tmp_path)
         return
 
-    # Count lines asynchronously
     def count_lines_sync():
         with open(tmp_path, 'r', encoding='utf-8') as f:
             count = 0
@@ -1081,7 +1020,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Use /dork <q> or upload .txt\n/pages | /tor | /filter N")
 
-# ─── CALLBACK HANDLER ───────────────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
@@ -1164,7 +1102,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in replies:
         await query.message.reply_text(replies[data])
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
         log.critical("BOT_TOKEN not set! Add to .env file or environment.")
