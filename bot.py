@@ -9,7 +9,7 @@
 
 import asyncio
 import aiohttp
-import aiofiles                     # <-- new dependency for async file I/O
+import aiofiles                     # pip install aiofiles
 import random
 import re
 import os
@@ -20,7 +20,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
-from typing import Union, List, Optional
+from typing import Union, List
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -499,6 +499,7 @@ async def consumer(results_q: asyncio.Queue,
                    batch_buffer: list,
                    total_dorks: int,
                    processed: list,        # mutable list for count
+                   total_raw: list,        # mutable list for raw count
                    stop_ev: asyncio.Event,
                    context, chat_id, status_msg, start_time,
                    batch_size: int = 1000):
@@ -542,10 +543,7 @@ async def consumer(results_q: asyncio.Queue,
 
         dork, engine, used_pages, scored, raw_count = item
         processed[0] += 1
-        total_raw = 0  # we don't track total_raw globally, but we can keep it locally
-        # Actually we need total_raw for final stats; we'll accumulate it.
-        # Let's keep total_raw as another mutable list in the outer scope.
-        # We'll pass it as an argument. We'll adjust.
+        total_raw[0] += raw_count
 
         # Deduplicate and write
         for sc, url in scored:
@@ -631,7 +629,7 @@ async def run_dork_job(chat_id: int,
     seen_urls = set()
     batch_buffer = []
     processed = [0]               # mutable list to pass by reference
-    total_raw = [0]               # we'll keep total raw count (may not be needed)
+    total_raw = [0]               # mutable list for raw URLs
 
     start_time = time.time()
     pages_str = ", ".join(str(p) for p in pages)
@@ -689,7 +687,7 @@ async def run_dork_job(chat_id: int,
     # Consumer task
     consumer_task = asyncio.create_task(
         consumer(results_q, tmp_path, seen_urls, batch_buffer,
-                 total_dorks, processed, stop_ev, context, chat_id,
+                 total_dorks, processed, total_raw, stop_ev, context, chat_id,
                  status_msg, start_time)
     )
 
@@ -1037,9 +1035,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tmp_path = tmp_file.name
     tmp_file.close()
     try:
-        await context.bot.get_file(doc.file_id).download_to_drive(tmp_path)
+        file = await context.bot.get_file(doc.file_id)
+        await file.download_to_drive(tmp_path)
     except Exception as e:
         await update.message.reply_text(f"❌ Download failed: {e}")
+        os.unlink(tmp_path)
         return
 
     # Count lines asynchronously
@@ -1063,9 +1063,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛡 SQL ≥{s.get('min_score',30)} | {'🧅TOR' if s.get('tor') else '🔓 Direct'}\n🚀 Starting..."
     )
 
-    # Run job with file path
     active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, tmp_path, total_dorks, context))
-    # Note: tmp_path will be deleted by run_dork_job after job finishes
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
