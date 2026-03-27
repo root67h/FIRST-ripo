@@ -1,9 +1,10 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v17.0 — STREAMING + SQLITE            ║
+║   DORK PARSER BOT v17.1 — STREAMING + SQLITE            ║
 ║   Handles 200k+ dorks | Bounded queues | Disk dedup     ║
 ║   Producer/Worker/Writer architecture                   ║
 ║   Pages 1-70 | Tor auto-rotation                        ║
+║   FIXED: sentinel shutdown, worker restart, perf, mem   ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -395,13 +396,14 @@ async def fetch_all_pages(session: aiohttp.ClientSession, dork: str, engine: str
     return all_urls
 
 
-# ─── SQLITE RESULT STORE (NEW) ─────────────────────────────────────────────
+# ─── SQLITE RESULT STORE (FIXED: ADDED PRAGMAS) ─────────────────────────────
 class SQLiteResultStore:
     """Thread‑safe SQLite store for URL deduplication and final output."""
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY, score INTEGER)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_score ON urls(score DESC)")
 
@@ -438,7 +440,7 @@ class SQLiteResultStore:
         self.conn.close()
 
 
-# ─── WORKER (UPDATED TO USE BATCH QUEUE) ────────────────────────────────────
+# ─── WORKER (FIXED: SENTINEL + FINALLY) ────────────────────────────────────
 async def dork_worker(
     wid: int,
     dork_queue: asyncio.Queue,
@@ -461,6 +463,11 @@ async def dork_worker(
         except asyncio.TimeoutError:
             continue
 
+        # Sentinel: exit worker
+        if dork is None:
+            dork_queue.task_done()
+            break
+
         engine = engines[eidx % len(engines)]
         eidx += 1
         log.info(f"[W{wid}][{engine.upper()}] {dork[:55]}")
@@ -482,14 +489,13 @@ async def dork_worker(
         scored = filter_scored(raw, min_score)
         log.info(f"[W{wid}] raw={len(raw)} kept={len(scored)}")
 
-        # Put result into results queue (dork, engine, raw_count, scored list)
         try:
             await results_queue.put((dork, engine, len(raw), scored))
         except asyncio.CancelledError:
             dork_queue.task_done()
             raise
-
-        dork_queue.task_done()
+        finally:
+            dork_queue.task_done()
 
         delay = random.uniform(MIN_DELAY, MAX_DELAY)
         if not raw:
@@ -497,11 +503,12 @@ async def dork_worker(
         await asyncio.sleep(delay)
 
 
-# ─── PRODUCER TASK (NEW) ──────────────────────────────────────────────────
+# ─── PRODUCER TASK (FIXED: SENDS SENTINELS) ─────────────────────────────────
 async def producer(
     dork_queue: asyncio.Queue,
     dork_stream: AsyncIterator[str],
     total_dorks: int,
+    worker_count: int,
     stop_ev: asyncio.Event
 ):
     """
@@ -514,10 +521,13 @@ async def producer(
             break
         await dork_queue.put(dork)
         dork_count += 1
+    # Push sentinel for each worker
+    for _ in range(worker_count):
+        await dork_queue.put(None)
     log.info(f"Producer finished: {dork_count} dorks enqueued (total expected: {total_dorks})")
 
 
-# ─── RESULT WRITER TASK (NEW) ──────────────────────────────────────────────
+# ─── RESULT WRITER TASK (FIXED: WORKER RESTART COUNT) ───────────────────────
 async def result_writer(
     results_queue: asyncio.Queue,
     store: SQLiteResultStore,
@@ -536,7 +546,8 @@ async def result_writer(
     engines: list,
     pages: list,
     max_res: int,
-    min_score: int
+    min_score: int,
+    dork_queue: asyncio.Queue   # added for restart (not used, but for clarity)
 ):
     """
     Consumes results from results_queue, inserts them into SQLite,
@@ -580,13 +591,14 @@ async def result_writer(
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*worker_tasks, return_exceptions=True)
+            old_worker_count = len(worker_tasks)   # save count before clearing
             worker_tasks.clear()
             # Close old session and create new
             await session_ref[0].close()
             new_session, _ = _make_job_session(use_tor)
             session_ref[0] = new_session
-            # Restart workers
-            for i in range(len(worker_tasks)):
+            # Restart workers using saved count
+            for i in range(old_worker_count):
                 t = asyncio.create_task(
                     dork_worker(i, dork_queue, results_queue, engines, pages, max_res,
                                 session_ref[0], min_score, stop_ev)
@@ -626,7 +638,7 @@ async def result_writer(
     log.info(f"Result writer finished: processed {processed} dorks, {new_urls_inserted} unique URLs")
 
 
-# ─── JOB RUNNER (REDESIGNED) ───────────────────────────────────────────────
+# ─── JOB RUNNER (UPDATED: PASS WORKER COUNT TO PRODUCER) ────────────────────
 async def run_dork_job(chat_id: int, dorks_source: AsyncIterator[str], total_dorks: int, context):
     """
     Main job controller with streaming producer, bounded queues, and SQLite dedup.
@@ -662,7 +674,7 @@ async def run_dork_job(chat_id: int, dorks_source: AsyncIterator[str], total_dor
 
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v17.0 — STREAMING\n"
+        f"🕷 DORK PARSER v17.1 — STREAMING\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -686,15 +698,18 @@ async def run_dork_job(chat_id: int, dorks_source: AsyncIterator[str], total_dor
         )
         worker_tasks.append(t)
 
-    # Create producer task
-    producer_task = asyncio.create_task(producer(dork_queue, dorks_source, total_dorks, stop_ev))
+    # Create producer task (pass worker count)
+    producer_task = asyncio.create_task(
+        producer(dork_queue, dorks_source, total_dorks, workers_n, stop_ev)
+    )
 
-    # Create result writer task
+    # Create result writer task (pass dork_queue for restart)
     writer_task = asyncio.create_task(
         result_writer(
             results_queue, store, total_dorks, context, chat_id, status_msg,
             start_time, pages_str, stop_ev, last_activity, consecutive_zero_raw,
-            worker_tasks, session_ref, use_tor, engines, pages, max_res, min_score
+            worker_tasks, session_ref, use_tor, engines, pages, max_res, min_score,
+            dork_queue
         )
     )
 
@@ -737,8 +752,8 @@ async def run_dork_job(chat_id: int, dorks_source: AsyncIterator[str], total_dor
     try:
         # Wait for producer to finish (it will exit when iterator exhausted)
         await producer_task
-        # Then wait for workers to finish (they will exit when queue empty and stop_ev not set)
-        # Wait for worker tasks to finish (they will stop when queue empty)
+        # Then wait for workers to finish (they will stop when queue empty and sentinels received)
+        # Wait for worker tasks to finish
         await asyncio.gather(*worker_tasks, return_exceptions=True)
         # Signal writer to stop (queue will be empty)
         stop_ev.set()
@@ -762,7 +777,7 @@ async def run_dork_job(chat_id: int, dorks_source: AsyncIterator[str], total_dor
             # Write all URLs to temp file with sections
             all_urls = await asyncio.to_thread(store.get_all_sorted)
             with open(tmp_txt.name, 'w', encoding='utf-8') as f:
-                f.write(f"# Dork Parser v17.0 — SQL Targeted Results\n")
+                f.write(f"# Dork Parser v17.1 — SQL Targeted Results\n")
                 f.write(f"# Date  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"# Dorks : {total_dorks} | Pages : {pages_str}\n")
                 f.write(f"# Filter: SQL ≥{min_score}\n")
@@ -871,7 +886,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📖 Help",         callback_data="m_help")],
     ]
     await update.message.reply_text(
-        "🕷 DORK PARSER v17.0 — STREAMING SQLITE\n"
+        "🕷 DORK PARSER v17.1 — STREAMING SQLITE\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ Streams 200k+ dorks | Bounded queues\n"
         "🗄️ SQLite dedup | Disk‑efficient\n"
@@ -912,21 +927,45 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not doc.file_name.endswith(".txt"):
         await update.message.reply_text("❌ Send a .txt file (one dork per line).")
         return
-    await update.message.reply_text("📥 Reading file...")
+    await update.message.reply_text("📥 Downloading file...")
+    tmp_path = None
     try:
-        content = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
-        # Count lines and create a streaming iterator
-        total_dorks = content.count(b'\n')
-        # Use BytesIO to stream lines
-        stream = io.BytesIO(content)
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(prefix=f"dorks_{chat_id}_", suffix=".txt", delete=False) as tmp:
+            tmp_path = tmp.name
+        file = await context.bot.get_file(doc.file_id)
+        await file.download_to_drive(tmp_path)
+
+        # Count lines without loading into memory (in thread)
+        def count_lines():
+            count = 0
+            with open(tmp_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        count += 1
+            return count
+        total_dorks = await asyncio.to_thread(count_lines)
+
+        # Streaming generator
         async def dork_stream():
-            for line in stream:
-                line = line.decode("utf-8", errors="replace").strip()
-                if line and not line.startswith("#"):
-                    yield line
-        active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, dork_stream(), total_dorks, context))
+            try:
+                with open(tmp_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            yield line
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+        active_jobs[chat_id] = asyncio.create_task(
+            run_dork_job(chat_id, dork_stream(), total_dorks, context)
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -943,9 +982,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, list_stream(), total_dorks, context))
     else:
         await update.message.reply_text("Use /dork <q> or upload .txt\n/pages | /tor | /filter N")
-
-# Other command handlers remain unchanged (cmd_pages, cmd_tor, cmd_filter, etc.)
-# They are identical to the original; we'll copy them here for completeness.
 
 async def cmd_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1187,7 +1223,7 @@ def main():
     app.shutdown_handler = shutdown
 
     log.info("=" * 55)
-    log.info("  DORK PARSER v17.0 — STREAMING + SQLITE")
+    log.info("  DORK PARSER v17.1 — STREAMING + SQLITE (FIXED)")
     log.info("=" * 55)
     app.run_polling(drop_pending_updates=True)
 
