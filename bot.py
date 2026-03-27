@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════╗
 ║   DORK PARSER BOT v17.0 — STREAMING + SQLITE            ║
 ║   Handles 200k+ dorks | Bounded queues | Disk dedup     ║
-║   Producer/Worker/Writer architecture                   ║
+║   Fixed /stop: results now delivered                    ║
 ║   Pages 1-70 | Tor auto-rotation                        ║
 ╚══════════════════════════════════════════════════════════╝
 """
@@ -738,7 +738,6 @@ async def run_dork_job(chat_id: int, dorks_source: AsyncIterator[str], total_dor
         # Wait for producer to finish (it will exit when iterator exhausted)
         await producer_task
         # Then wait for workers to finish (they will exit when queue empty and stop_ev not set)
-        # Wait for worker tasks to finish (they will stop when queue empty)
         await asyncio.gather(*worker_tasks, return_exceptions=True)
         # Signal writer to stop (queue will be empty)
         stop_ev.set()
@@ -746,15 +745,24 @@ async def run_dork_job(chat_id: int, dorks_source: AsyncIterator[str], total_dor
     except asyncio.CancelledError:
         log.info(f"[JOB] Cancelled for {chat_id}")
         stop_ev.set()
-        # Cancel all tasks
+
+        # Cancel only producer and workers; writer, watchdog and timeout should finish naturally
         producer_task.cancel()
         for t in worker_tasks:
             t.cancel()
-        writer_task.cancel()
+
+        # Wait for producer and workers to terminate
+        await asyncio.gather(producer_task, *worker_tasks, return_exceptions=True)
+
+        # Wait for writer to finish processing any remaining results in the queue
+        await writer_task
+
+        # Watchdog and timeout are not essential for final output; we let them be cancelled implicitly
+        # when the job ends, but we cancel them to avoid warnings
         watchdog_task.cancel()
         timeout_task.cancel()
-        await asyncio.gather(producer_task, *worker_tasks, writer_task,
-                             watchdog_task, timeout_task, return_exceptions=True)
+        await asyncio.gather(watchdog_task, timeout_task, return_exceptions=True)
+
     finally:
         # Finalize: generate output file from SQLite
         unique_count = store.count()
@@ -943,9 +951,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, list_stream(), total_dorks, context))
     else:
         await update.message.reply_text("Use /dork <q> or upload .txt\n/pages | /tor | /filter N")
-
-# Other command handlers remain unchanged (cmd_pages, cmd_tor, cmd_filter, etc.)
-# They are identical to the original; we'll copy them here for completeness.
 
 async def cmd_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1187,7 +1192,7 @@ def main():
     app.shutdown_handler = shutdown
 
     log.info("=" * 55)
-    log.info("  DORK PARSER v17.0 — STREAMING + SQLITE")
+    log.info("  DORK PARSER v17.0 — STREAMING + SQLITE (FIXED STOP)")
     log.info("=" * 55)
     app.run_polling(drop_pending_updates=True)
 
