@@ -5,6 +5,7 @@
 ║   Watchdog + auto-restart | Global job timeout          ║
 ║   Bounded queues | No deadlocks                         ║
 ║   Pages 1-70 | Tor auto-rotation                       ║
+║   FIXED: queue full handling, self-restart polling     ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -76,7 +77,6 @@ user_sessions: dict = {}
 active_jobs:   dict = {}
 
 # ─── SHARED CONNECTOR (lazy) ─────────────────────────────────────────────────
-# FIX: aiohttp.TCPConnector must be created inside a running event loop.
 SHARED_CONNECTOR = None
 
 def get_shared_connector() -> aiohttp.TCPConnector:
@@ -560,8 +560,9 @@ async def dork_worker(wid: int,
             log.warning(f"[W{wid}] fetch_all_pages timeout after {WORKER_FETCH_TIMEOUT}s: {dork[:55]}")
         except asyncio.CancelledError:
             try:
-                results_q.put_nowait((dork, engine, pages, [], 0))
-            except asyncio.QueueFull:
+                # Use await put with timeout to avoid deadlock
+                await asyncio.wait_for(results_q.put((dork, engine, pages, [], 0)), timeout=10)
+            except (asyncio.TimeoutError, asyncio.QueueFull):
                 pass
             queue.task_done()
             raise
@@ -572,9 +573,10 @@ async def dork_worker(wid: int,
         log.info(f"[W{wid}] raw={len(raw)} kept={len(scored)}")
 
         try:
-            results_q.put_nowait((dork, engine, pages, scored, len(raw)))
-        except asyncio.QueueFull:
-            await results_q.put((dork, engine, pages, scored, len(raw)))
+            # Wait up to 30 seconds for space in queue, then skip
+            await asyncio.wait_for(results_q.put((dork, engine, pages, scored, len(raw))), timeout=30)
+        except asyncio.TimeoutError:
+            log.warning(f"[W{wid}] Could not enqueue result for {dork[:55]}, queue full")
 
         queue.task_done()
 
@@ -1183,12 +1185,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in replies:
         await query.message.reply_text(replies[data])
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────
-def main():
-    if not BOT_TOKEN:
-        log.critical("BOT_TOKEN not set! Add to .env file or environment.")
-        raise SystemExit(1)
+# ─── GLOBAL EXCEPTION HANDLER FOR EVENT LOOP ───────────────────────────────
+def handle_loop_exception(loop, context):
+    log.critical(f"Unhandled exception in event loop: {context}", exc_info=context.get("exception"))
 
+# ─── CLEANUP SHARED CONNECTOR ─────────────────────────────────────────────
+async def cleanup_shared_connector():
+    global SHARED_CONNECTOR
+    if SHARED_CONNECTOR and not SHARED_CONNECTOR.closed:
+        await SHARED_CONNECTOR.close()
+        log.info("Closed shared connector")
+
+# ─── MAIN WITH SELF-RESTARTING POLLING ─────────────────────────────────────
+async def run_bot():
     app = Application.builder().token(BOT_TOKEN).build()
 
     for name, handler in [
@@ -1211,14 +1220,41 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    async def shutdown():
-        stop_tor_rotation()
-    app.shutdown_handler = shutdown
+    # Set global exception handler
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(handle_loop_exception)
+
+    # Register shutdown cleanup
+    app.shutdown_handler = cleanup_shared_connector
+
+    # Polling loop with auto-restart
+    while True:
+        try:
+            log.info("Starting bot polling...")
+            await app.run_polling(drop_pending_updates=True)
+        except Exception as e:
+            log.critical(f"Polling crashed: {e}", exc_info=True)
+            log.info("Restarting in 10 seconds...")
+            await asyncio.sleep(10)
+        else:
+            # Normal shutdown (e.g., SIGINT)
+            break
+
+def main():
+    if not BOT_TOKEN:
+        log.critical("BOT_TOKEN not set! Add to .env file or environment.")
+        raise SystemExit(1)
 
     log.info("=" * 55)
     log.info("  DORK PARSER v16.1 — ANTI-BLOCK + CAPTCHA BYPASS")
     log.info("=" * 55)
-    app.run_polling(drop_pending_updates=True)
+
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        log.info("Shutdown requested")
+        # Clean up shared connector manually
+        asyncio.run(cleanup_shared_connector())
 
 if __name__ == "__main__":
     main()
