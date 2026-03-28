@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v16.0 — ENHANCED RELIABILITY          ║
+║   DORK PARSER BOT v16.1 — ANTI-BLOCK + CAPTCHA BYPASS   ║
 ║   Robust HTML parsing | Per-job session | Early dedup   ║
 ║   Watchdog + auto-restart | Global job timeout          ║
 ║   Bounded queues | No deadlocks                         ║
@@ -57,11 +57,11 @@ ENGINES   = ["bing", "yahoo"]
 MAX_PAGES = 70
 
 # ─── RELIABILITY CONSTANTS ──────────────────────────────────────────────────
-WORKER_FETCH_TIMEOUT = 120          # seconds per multi-page fetch
-WATCHDOG_INTERVAL    = 30           # seconds between watchdog checks
-WATCHDOG_STALL_LIMIT = 90           # seconds without result before restart
-SESSION_RESET_THRESHOLD = 8         # consecutive zero-raw dorks before session recycle
-JOB_TIMEOUT          = 30 * 60      # 30 minutes total job runtime
+WORKER_FETCH_TIMEOUT = 120
+WATCHDOG_INTERVAL    = 30
+WATCHDOG_STALL_LIMIT = 90
+SESSION_RESET_THRESHOLD = 8
+JOB_TIMEOUT          = 30 * 60
 
 DEFAULT_SESSION = {
     "workers": WORKERS,
@@ -75,15 +75,19 @@ DEFAULT_SESSION = {
 user_sessions: dict = {}
 active_jobs:   dict = {}
 
-# ─── SHARED CONNECTOR ───────────────────────────────────────────────────────
-SHARED_CONNECTOR = aiohttp.TCPConnector(
-    ssl=False,
-    limit=100,
-    limit_per_host=10,
-    ttl_dns_cache=300,
-)
+# ─── SHARED CONNECTOR (lazy) ─────────────────────────────────────────────────
+# FIX: aiohttp.TCPConnector must be created inside a running event loop.
+SHARED_CONNECTOR = None
 
-# ─── TOR ROTATION ──────────────────────────────────────────────────────────
+def get_shared_connector() -> aiohttp.TCPConnector:
+    global SHARED_CONNECTOR
+    if SHARED_CONNECTOR is None or SHARED_CONNECTOR.closed:
+        SHARED_CONNECTOR = aiohttp.TCPConnector(
+            ssl=False, limit=100, limit_per_host=10, ttl_dns_cache=300,
+        )
+    return SHARED_CONNECTOR
+
+# ─── TOR ROTATION ───────────────────────────────────────────────────────────
 tor_rotation_task = None
 tor_enabled_users = 0
 
@@ -129,7 +133,7 @@ def stop_tor_rotation():
         tor_rotation_task = None
         log.info("Tor rotation task stopped")
 
-# ─── SQL FILTER ENGINE ─────────────────────────────────────────────────────
+# ─── SQL FILTER ENGINE ──────────────────────────────────────────────────────
 BLACKLISTED_DOMAINS = {
     "yahoo.uservoice.com", "uservoice.com", "bing.com", "google.com", "googleapis.com",
     "gstatic.com", "youtube.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
@@ -175,49 +179,37 @@ def score_url(url: str) -> int:
         parsed = urlparse(url)
     except Exception:
         return 0
-
     if not url.startswith("http"):
         return 0
-
     domain = parsed.netloc.lower()
     for bd in BLACKLISTED_DOMAINS:
         if bd in domain:
             return 0
-
     if _JUNK_RE.search(url):
         return 0
-
     query = parsed.query
     path  = parsed.path.lower()
-
     has_vuln_ext = any(path.endswith(ext) for ext in VULN_EXTENSIONS)
     if not query:
         return 25 if has_vuln_ext else 5
-
     score  = 15
     params = parse_qs(query, keep_blank_values=True)
     pkeys  = {k.lower() for k in params}
-
     if has_vuln_ext:
         score += 20
-
     score += len(pkeys & SQL_HIGH_PARAMS) * 15
     score += len(pkeys & SQL_MED_PARAMS)  * 5
-
     for vals in params.values():
         for v in vals:
             if v.isdigit():
                 score += 10
                 break
-
     if len(url) > 300:
         score -= 10
     elif len(url) > 200:
         score -= 5
-
     if len(params) > 8:
         score -= 5
-
     return max(0, min(score, 100))
 
 def filter_scored(urls: list, min_score: int) -> list:
@@ -269,101 +261,245 @@ def _extract_links(html: str) -> list[str]:
     return p.links
 
 
-# ─── SEARCH ENGINE FUNCTIONS ─────────────────────────────────────────────
+# ─── SEARCH ENGINE FUNCTIONS ─────────────────────────────────────────────────
+# ═══ PATCHED SECTION: Anti-block + CAPTCHA bypass ════════════════════════════
+
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    # Chrome Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Chrome Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    # Firefox Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (iPad; CPU OS 17_3 like Mac OS X) AppleWebKit/605.1.15 Mobile Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/122.0 Mobile Safari/537.36",
+    # Firefox Linux
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    # Safari Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    # Edge
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+    # Mobile Chrome
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+    # Mobile Safari
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
 ]
+
+# Matching sec-ch-ua strings — avoids Chrome header mismatch fingerprinting
+_SEC_CH_UA_MAP = {
+    "Chrome/123": '"Chromium";v="123", "Not(A:Brand";v="24", "Google Chrome";v="123"',
+    "Chrome/122": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Chrome/121": '"Chromium";v="121", "Not(A:Brand";v="24", "Google Chrome";v="121"',
+    "Edg/122":    '"Microsoft Edge";v="122", "Chromium";v="122", "Not(A:Brand";v="24"',
+}
 
 _BING_NOISE    = re.compile(r"bing\.com", re.IGNORECASE)
 _YAHOO_NOISE   = re.compile(r"yimg\.com|yahoo\.com|doubleclick\.net|googleadservices", re.IGNORECASE)
 _STATIC_EXT    = re.compile(r"\.(css|js|png|jpg|jpeg|gif|svg|ico|webp|woff2?|ttf|eot)(\?|$)", re.IGNORECASE)
 _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 
+# Block / CAPTCHA detection
+_BLOCK_RE = re.compile(
+    r"captcha|robot|automated|unusual.{0,20}traffic|"
+    r"access.{0,20}denied|please.{0,20}verify|"
+    r"verify.{0,20}human|are you a human|security check|"
+    r"blocked|too many requests|rate.{0,10}limit",
+    re.IGNORECASE
+)
+
+def _is_blocked(html: str) -> bool:
+    """Return True if response is a CAPTCHA or block page."""
+    if len(html) < 2000:       # real results pages are never this short
+        return True
+    return bool(_BLOCK_RE.search(html[:4000]))
+
+def _pick_ua() -> tuple[str, dict]:
+    """Return (ua_string, extra_sec_ch_ua_headers) with consistent fingerprint."""
+    ua = random.choice(USER_AGENTS)
+    extra = {}
+    for key, val in _SEC_CH_UA_MAP.items():
+        if key in ua:
+            extra["sec-ch-ua"]          = val
+            extra["sec-ch-ua-mobile"]   = "?1" if "Mobile" in ua else "?0"
+            extra["sec-ch-ua-platform"] = (
+                '"Android"' if "Android" in ua else
+                '"iOS"'     if "iPhone"  in ua else
+                '"macOS"'   if "Mac"     in ua else
+                '"Windows"'
+            )
+            break
+    return ua, extra
+
 
 async def fetch_page_bing(session: aiohttp.ClientSession, dork: str, page: int, max_res: int) -> list:
-    try:
-        params = {
-            "q": dork, "count": min(max_res, 10),
-            "first": (page - 1) * 10 + 1, "setlang": "en",
-        }
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-        }
-        async with session.get(
-            "https://www.bing.com/search", params=params,
-            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
-            if resp.status != 200:
-                return []
-            html = await resp.text(errors="replace")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            ua, ch_extra = _pick_ua()
+            params = {
+                "q": dork, "count": min(max_res, 10),
+                "first": (page - 1) * 10 + 1, "setlang": "en",
+            }
+            headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": random.choice([
+                    "en-US,en;q=0.9",
+                    "en-GB,en;q=0.9,en-US;q=0.8",
+                    "en-US,en;q=0.8,es;q=0.5",
+                ]),
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": random.choice([
+                    "https://www.bing.com/",
+                    "https://www.google.com/",
+                    "https://duckduckgo.com/",
+                ]),
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
+                **ch_extra,
+            }
 
-        raw  = _extract_links(html)
-        urls = [u for u in raw if u.startswith("http") and not _BING_NOISE.search(u)]
-        return list(dict.fromkeys(urls))[:max_res]
+            async with session.get(
+                "https://www.bing.com/search", params=params,
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
+            ) as resp:
+                if resp.status in (429, 503):
+                    wait = (2 ** attempt) * random.uniform(3.0, 6.0)
+                    log.warning(f"[BING] HTTP {resp.status} page {page}, retry {attempt+1} in {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status != 200:
+                    log.warning(f"[BING] HTTP {resp.status} page {page}")
+                    return []
+                html = await resp.text(errors="replace")
 
-    except Exception as e:
-        log.warning(f"[BING] page {page} error: {e}")
-        return []
+            if _is_blocked(html):
+                wait = (2 ** attempt) * random.uniform(4.0, 8.0)
+                log.warning(f"[BING] Block/CAPTCHA page {page}, retry {attempt+1} in {wait:.1f}s")
+                await asyncio.sleep(wait)
+                continue
+
+            raw  = _extract_links(html)
+            urls = [u for u in raw if u.startswith("http") and not _BING_NOISE.search(u)]
+            return list(dict.fromkeys(urls))[:max_res]
+
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            log.warning(f"[BING] Timeout page {page}, attempt {attempt+1}")
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+        except Exception as e:
+            log.warning(f"[BING] page {page} error: {e}")
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+
+    log.warning(f"[BING] Gave up on page {page} after {max_retries} attempts")
+    return []
 
 
 async def fetch_page_yahoo(session: aiohttp.ClientSession, dork: str, page: int, max_res: int) -> list:
-    try:
-        params = {
-            "p": dork, "b": (page - 1) * 10 + 1,
-            "pz": min(max_res, 10), "vl": "lang_en",
-        }
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://search.yahoo.com/",
-        }
-        async with session.get(
-            "https://search.yahoo.com/search", params=params,
-            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
-            if resp.status != 200:
-                return []
-            html = await resp.text(errors="replace")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            ua, ch_extra = _pick_ua()
+            params = {
+                "p": dork, "b": (page - 1) * 10 + 1,
+                "pz": min(max_res, 10), "vl": "lang_en",
+            }
+            headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": random.choice([
+                    "en-US,en;q=0.9",
+                    "en-GB,en;q=0.9,en-US;q=0.8",
+                    "en-US,en;q=0.8,es;q=0.5",
+                ]),
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": random.choice([
+                    "https://search.yahoo.com/",
+                    "https://www.yahoo.com/",
+                    "https://www.google.com/",
+                ]),
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
+                **ch_extra,
+            }
 
-        raw  = _extract_links(html)
-        urls = []
-        for u in raw:
-            if not u.startswith("http"):
+            async with session.get(
+                "https://search.yahoo.com/search", params=params,
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
+            ) as resp:
+                if resp.status in (429, 503):
+                    wait = (2 ** attempt) * random.uniform(3.0, 6.0)
+                    log.warning(f"[YAHOO] HTTP {resp.status} page {page}, retry {attempt+1} in {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status != 200:
+                    log.warning(f"[YAHOO] HTTP {resp.status} page {page}")
+                    return []
+                html = await resp.text(errors="replace")
+
+            if _is_blocked(html):
+                wait = (2 ** attempt) * random.uniform(4.0, 8.0)
+                log.warning(f"[YAHOO] Block/CAPTCHA page {page}, retry {attempt+1} in {wait:.1f}s")
+                await asyncio.sleep(wait)
                 continue
-            if "r.search.yahoo.com" in u or "/r/" in u:
-                parsed = urlparse(u)
-                qs = parse_qs(parsed.query)
-                if "RU" in qs:
-                    real = unquote(qs["RU"][0])
-                    if real.startswith(("http://", "https://")):
-                        u = real
-                else:
-                    m = _YAHOO_RU_PATH.search(parsed.path)
-                    if m:
-                        real = unquote(m.group(1))
+
+            raw  = _extract_links(html)
+            urls = []
+            for u in raw:
+                if not u.startswith("http"):
+                    continue
+                if "r.search.yahoo.com" in u or "/r/" in u:
+                    parsed = urlparse(u)
+                    qs = parse_qs(parsed.query)
+                    if "RU" in qs:
+                        real = unquote(qs["RU"][0])
                         if real.startswith(("http://", "https://")):
                             u = real
-            if _YAHOO_NOISE.search(u):
-                continue
-            if _STATIC_EXT.search(u):
-                continue
-            urls.append(u)
+                    else:
+                        m = _YAHOO_RU_PATH.search(parsed.path)
+                        if m:
+                            real = unquote(m.group(1))
+                            if real.startswith(("http://", "https://")):
+                                u = real
+                if _YAHOO_NOISE.search(u):
+                    continue
+                if _STATIC_EXT.search(u):
+                    continue
+                urls.append(u)
 
-        return list(dict.fromkeys(urls))[:max_res]
+            return list(dict.fromkeys(urls))[:max_res]
 
-    except Exception as e:
-        log.warning(f"[YAHOO] page {page} error: {e}")
-        return []
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            log.warning(f"[YAHOO] Timeout page {page}, attempt {attempt+1}")
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+        except Exception as e:
+            log.warning(f"[YAHOO] page {page} error: {e}")
+            await asyncio.sleep(random.uniform(1.0, 3.0))
 
+    log.warning(f"[YAHOO] Gave up on page {page} after {max_retries} attempts")
+    return []
+
+# ═══ END PATCHED SECTION ═════════════════════════════════════════════════════
 
 # ─── FETCH ALL PAGES ─────────────────────────────────────────────────────────
 async def fetch_all_pages(session: aiohttp.ClientSession, dork: str, engine: str,
@@ -388,7 +524,7 @@ async def fetch_all_pages(session: aiohttp.ClientSession, dork: str, engine: str
                 break
 
         if len(sorted_pages) > 1 and page != sorted_pages[-1]:
-            await asyncio.sleep(random.uniform(0.3, 0.8))
+            await asyncio.sleep(random.uniform(1.0, 3.0))   # wider = more human
 
     return all_urls
 
@@ -403,10 +539,6 @@ async def dork_worker(wid: int,
                       session: aiohttp.ClientSession,
                       min_score: int,
                       stop_ev: asyncio.Event):
-    """
-    Pull dork from queue, fetch results, push to results_q.
-    Always calls queue.task_done() after processing.
-    """
     eidx = wid % len(engines)
     while not stop_ev.is_set():
         try:
@@ -427,7 +559,6 @@ async def dork_worker(wid: int,
         except asyncio.TimeoutError:
             log.warning(f"[W{wid}] fetch_all_pages timeout after {WORKER_FETCH_TIMEOUT}s: {dork[:55]}")
         except asyncio.CancelledError:
-            # Ensure we mark task done and push a dummy result so collector doesn't hang
             try:
                 results_q.put_nowait((dork, engine, pages, [], 0))
             except asyncio.QueueFull:
@@ -443,7 +574,6 @@ async def dork_worker(wid: int,
         try:
             results_q.put_nowait((dork, engine, pages, scored, len(raw)))
         except asyncio.QueueFull:
-            # Wait a bit if queue is full; shouldn't happen with bounded queue but be safe
             await results_q.put((dork, engine, pages, scored, len(raw)))
 
         queue.task_done()
@@ -456,49 +586,37 @@ async def dork_worker(wid: int,
 
 # ─── JOB RUNNER ──────────────────────────────────────────────────────────────
 async def run_dork_job(chat_id: int, dorks: list, context):
-    """
-    Main job controller with:
-        - bounded input/output queues
-        - worker tasks
-        - result collector with incremental file write
-        - watchdog that restarts workers on stall
-        - session recycling on many zero‑raw results
-        - global job timeout
-    """
     sess = get_session(chat_id)
-    engines = sess.get("engines", list(ENGINES))
+    engines   = sess.get("engines", list(ENGINES))
     workers_n = sess.get("workers", WORKERS)
-    max_res = sess.get("max_results", MAX_RESULTS)
-    pages = sess.get("pages", [1])
-    use_tor = sess.get("tor", False)
+    max_res   = sess.get("max_results", MAX_RESULTS)
+    pages     = sess.get("pages", [1])
+    use_tor   = sess.get("tor", False)
     min_score = sess.get("min_score", 30)
 
-    # Per-job session
     job_session, _ = _make_job_session(use_tor)
-    job_session_ref = [job_session]  # mutable for watchdog
+    job_session_ref = [job_session]
 
-    # Bounded queues to limit memory
     queue = asyncio.Queue(maxsize=len(dorks) * 2)
     for d in dorks:
         await queue.put(d)
-    results_q = asyncio.Queue(maxsize=1000)  # cap results
+    results_q = asyncio.Queue(maxsize=1000)
 
-    stop_ev = asyncio.Event()
+    stop_ev     = asyncio.Event()
     total_dorks = len(dorks)
-    processed = 0
-    seen_urls = set()
-    all_scored = []          # (score, url) for final file
-    total_raw = 0
-    start_time = time.time()
-    pages_str = ", ".join(str(p) for p in pages)
+    processed   = 0
+    seen_urls   = set()
+    all_scored  = []
+    total_raw   = 0
+    start_time  = time.time()
+    pages_str   = ", ".join(str(p) for p in pages)
 
-    # Temporary file for incremental writing
     tmp_file = tempfile.NamedTemporaryFile(
         mode='w', encoding='utf-8', delete=False,
         prefix=f"dork_{chat_id}_", suffix='.txt'
     )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v16.0 — SQL Targeted Results\n")
+    tmp_file.write(f"# Dork Parser v16.1 — SQL Targeted Results\n")
     tmp_file.write(f"# Date  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     tmp_file.write(f"# Dorks : {total_dorks} | Pages : {pages_str}\n")
     tmp_file.write(f"# Filter: SQL ≥{min_score}\n")
@@ -507,7 +625,7 @@ async def run_dork_job(chat_id: int, dorks: list, context):
 
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v16.0 — STARTED\n"
+        f"🕷 DORK PARSER v16.1 — STARTED\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -518,16 +636,14 @@ async def run_dork_job(chat_id: int, dorks: list, context):
         f"{'━'*30}\n⏳ Starting..."
     )
 
-    # Shared state for watchdog
-    last_result_ts = [time.time()]          # mutable list
-    consecutive_zero_raw = 0
+    last_result_ts          = [time.time()]
+    consecutive_zero_raw    = 0
     restarts_without_progress = 0
-    max_restarts = 3
+    max_restarts            = 3
 
-    # Helper to write buffered results to file
     batch_buffer = []
-    batch_size = 1000
-    flush_lock = asyncio.Lock()
+    batch_size   = 1000
+    flush_lock   = asyncio.Lock()
 
     async def flush_buffer():
         nonlocal batch_buffer
@@ -535,25 +651,21 @@ async def run_dork_job(chat_id: int, dorks: list, context):
             return
         async with flush_lock:
             with open(tmp_path, 'a', encoding='utf-8') as f:
-                high = [u for sc, u in batch_buffer if sc >= 70]
+                high   = [u for sc, u in batch_buffer if sc >= 70]
                 medium = [u for sc, u in batch_buffer if 40 <= sc < 70]
-                low = [u for sc, u in batch_buffer if sc < 40]
+                low    = [u for sc, u in batch_buffer if sc < 40]
                 if high:
                     f.write("# HIGH VALUE (score 70+)\n")
-                    for u in high:
-                        f.write(f"{u}\n")
+                    for u in high:   f.write(f"{u}\n")
                 if medium:
                     f.write("\n# MEDIUM VALUE (score 40-69)\n")
-                    for u in medium:
-                        f.write(f"{u}\n")
+                    for u in medium: f.write(f"{u}\n")
                 if low and min_score < 40:
                     f.write("\n# LOW VALUE (score < 40)\n")
-                    for u in low:
-                        f.write(f"{u}\n")
+                    for u in low:    f.write(f"{u}\n")
                 f.write("\n")
             batch_buffer.clear()
 
-    # Worker tasks (mutable list so watchdog can modify)
     worker_tasks = []
     for i in range(workers_n):
         t = asyncio.create_task(
@@ -562,49 +674,35 @@ async def run_dork_job(chat_id: int, dorks: list, context):
         )
         worker_tasks.append(t)
 
-    # Watchdog
     async def watchdog():
         nonlocal restarts_without_progress, consecutive_zero_raw
         while not stop_ev.is_set():
             await asyncio.sleep(WATCHDOG_INTERVAL)
             if stop_ev.is_set():
                 break
-
             elapsed = time.time() - last_result_ts[0]
             if elapsed < WATCHDOG_STALL_LIMIT:
                 continue
-
-            # Stall detected
             alive = sum(1 for t in worker_tasks if not t.done())
             log.warning(
                 f"[WATCHDOG][{chat_id}] Stall: no result for {elapsed:.0f}s, "
                 f"alive={alive}/{len(worker_tasks)}"
             )
-
-            # Cancel all workers
             for t in worker_tasks:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*worker_tasks, return_exceptions=True)
             worker_tasks.clear()
-
             if stop_ev.is_set():
                 break
-
-            # If queue is empty, we're done
             if queue.empty():
                 log.info(f"[WATCHDOG][{chat_id}] Queue empty, not restarting workers")
                 break
-
-            # Check if we are making any progress at all
-            # If after max_restarts we still get stalls, abort job
             restarts_without_progress += 1
             if restarts_without_progress > max_restarts:
                 log.critical(f"[WATCHDOG][{chat_id}] Too many restarts, aborting job")
                 stop_ev.set()
                 break
-
-            # Restart workers
             log.info(f"[WATCHDOG][{chat_id}] Restarting {workers_n} workers after stall")
             for i in range(workers_n):
                 t = asyncio.create_task(
@@ -612,10 +710,9 @@ async def run_dork_job(chat_id: int, dorks: list, context):
                                 job_session_ref[0], min_score, stop_ev)
                 )
                 worker_tasks.append(t)
-            last_result_ts[0] = time.time()   # reset stall clock
-            consecutive_zero_raw = 0          # reset zero counter
+            last_result_ts[0] = time.time()
+            consecutive_zero_raw = 0
 
-    # Result collector
     async def collector():
         nonlocal processed, total_raw, consecutive_zero_raw, restarts_without_progress
         nonlocal batch_buffer, all_scored
@@ -625,20 +722,17 @@ async def run_dork_job(chat_id: int, dorks: list, context):
                     results_q.get(), timeout=45.0
                 )
             except asyncio.TimeoutError:
-                # No result for 45s – workers might be dead. Watchdog will handle.
                 continue
 
-            # Update progress
             processed += 1
             total_raw += raw_count
-            last_result_ts[0] = time.time()   # reset stall clock
-            restarts_without_progress = 0     # we made progress
+            last_result_ts[0] = time.time()
+            restarts_without_progress = 0
 
             if raw_count == 0:
                 consecutive_zero_raw += 1
                 if consecutive_zero_raw >= SESSION_RESET_THRESHOLD:
-                    log.warning(f"[JOB][{chat_id}] {SESSION_RESET_THRESHOLD} zero‑raw results – recycling session")
-                    # Cancel workers, swap session, restart
+                    log.warning(f"[JOB][{chat_id}] {SESSION_RESET_THRESHOLD} zero-raw results – recycling session")
                     for t in worker_tasks:
                         if not t.done():
                             t.cancel()
@@ -658,7 +752,6 @@ async def run_dork_job(chat_id: int, dorks: list, context):
             else:
                 consecutive_zero_raw = 0
 
-            # Deduplicate and accumulate
             for sc, url in scored:
                 if url not in seen_urls:
                     seen_urls.add(url)
@@ -668,12 +761,11 @@ async def run_dork_job(chat_id: int, dorks: list, context):
             if len(batch_buffer) >= batch_size:
                 await flush_buffer()
 
-            # Update status message every few seconds
             if time.time() - getattr(collector, 'last_edit', 0) > 4:
-                pct = int(processed / total_dorks * 100)
-                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                pct     = int(processed / total_dorks * 100)
+                bar     = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 elapsed = int(time.time() - start_time)
-                eta = int((elapsed / processed) * (total_dorks - processed)) if processed else 0
+                eta     = int((elapsed / processed) * (total_dorks - processed)) if processed else 0
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
@@ -693,46 +785,37 @@ async def run_dork_job(chat_id: int, dorks: list, context):
                 except Exception:
                     pass
 
-    # Global timeout task
     async def job_timeout():
         await asyncio.sleep(JOB_TIMEOUT)
         log.warning(f"[JOB][{chat_id}] Global timeout ({JOB_TIMEOUT}s) reached")
         stop_ev.set()
 
-    # Start tasks
     collector_task = asyncio.create_task(collector())
-    watchdog_task = asyncio.create_task(watchdog())
-    timeout_task = asyncio.create_task(job_timeout())
+    watchdog_task  = asyncio.create_task(watchdog())
+    timeout_task   = asyncio.create_task(job_timeout())
 
     try:
-        # Wait for all workers to finish (they exit when queue empty and stop_ev not set)
         await asyncio.gather(*worker_tasks, return_exceptions=True)
-        # When workers are done, queue is empty, collector will finish
         await collector_task
-        # Final flush
         await flush_buffer()
     except asyncio.CancelledError:
         log.info(f"[JOB] Cancelled for {chat_id}")
         stop_ev.set()
-        # Cancel any remaining tasks
         for t in worker_tasks:
             t.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
         collector_task.cancel()
         await asyncio.gather(collector_task, return_exceptions=True)
-        # Still try to flush what we have
         await flush_buffer()
         raise
     finally:
-        # Cancel timeout and watchdog
         timeout_task.cancel()
         watchdog_task.cancel()
         await asyncio.gather(timeout_task, watchdog_task, return_exceptions=True)
         await job_session_ref[0].close()
         active_jobs.pop(chat_id, None)
 
-    # Job finished normally
-    elapsed = int(time.time() - start_time)
+    elapsed    = int(time.time() - start_time)
     unique_cnt = len(seen_urls)
     try:
         await context.bot.edit_message_text(
@@ -770,7 +853,6 @@ async def run_dork_job(chat_id: int, dorks: list, context):
 
 # ─── SESSION FACTORY ─────────────────────────────────────────────────────────
 def _make_job_session(use_tor: bool):
-    """Return (session, connector_owned)."""
     if use_tor:
         try:
             from aiohttp_socks import ProxyConnector
@@ -778,10 +860,10 @@ def _make_job_session(use_tor: bool):
             return aiohttp.ClientSession(connector=connector, connector_owner=True), True
         except ImportError:
             log.warning("[TOR] aiohttp_socks not installed, using direct")
-    return aiohttp.ClientSession(connector=SHARED_CONNECTOR, connector_owner=False), False
+    return aiohttp.ClientSession(connector=get_shared_connector(), connector_owner=False), False
 
 
-# ─── UI HELPERS ────────────────────────────────────────────────────────────
+# ─── UI HELPERS ─────────────────────────────────────────────────────────────
 def get_session(chat_id: int) -> dict:
     if chat_id not in user_sessions:
         user_sessions[chat_id] = dict(DEFAULT_SESSION)
@@ -807,7 +889,7 @@ def page_keyboard(selected: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ─── COMMAND HANDLERS ───────────────────────────────────────────────────────
+# ─── COMMAND HANDLERS ────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📂 Bulk Upload",  callback_data="m_bulk"),
@@ -819,12 +901,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📖 Help",         callback_data="m_help")],
     ]
     await update.message.reply_text(
-        "🕷 DORK PARSER v16.0 — ENHANCED RELIABILITY\n"
+        "🕷 DORK PARSER v16.1 — ANTI-BLOCK EDITION\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ Workers | Sequential pages | Stop on 3 empty pages\n"
-        "🔁 Auto‑restart on stall | Session reset on zero results\n"
+        "🔁 Auto-restart on stall | Session reset on zero results\n"
         "🛡 SQL filter (adjust with /filter)\n"
-        "🧅 Tor auto‑rotation every 2 minutes\n"
+        "🧅 Tor auto-rotation every 2 minutes\n"
+        "🚫 Anti-block + CAPTCHA bypass built-in\n"
         "⏱️ Global job timeout: 30 min\n\n"
         "📌 Commands:\n"
         "  /dork <q>   — single dork\n"
@@ -868,15 +951,12 @@ async def cmd_tor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global tor_enabled_users
     chat_id = update.effective_chat.id
     sess    = get_session(chat_id)
-
     if context.args and context.args[0].lower() in ("on", "off"):
         new_val = context.args[0].lower() == "on"
     else:
         new_val = not sess.get("tor", False)
-
     old_val     = sess.get("tor", False)
     sess["tor"] = new_val
-
     if new_val and not old_val:
         tor_enabled_users += 1
         if tor_enabled_users == 1:
@@ -977,7 +1057,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Job RUNNING" if job and not job.done() else "💤 No active job"
     )
 
-# ─── DOCUMENT & TEXT HANDLERS ───────────────────────────────────────────────
+# ─── DOCUMENT & TEXT HANDLERS ────────────────────────────────────────────────
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     doc     = update.message.document
@@ -1020,7 +1100,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Use /dork <q> or upload .txt\n/pages | /tor | /filter N")
 
-# ─── CALLBACK HANDLER ───────────────────────────────────────────────────────
+# ─── CALLBACK HANDLER ────────────────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
@@ -1136,7 +1216,7 @@ def main():
     app.shutdown_handler = shutdown
 
     log.info("=" * 55)
-    log.info("  DORK PARSER v16.0 — ENHANCED RELIABILITY")
+    log.info("  DORK PARSER v16.1 — ANTI-BLOCK + CAPTCHA BYPASS")
     log.info("=" * 55)
     app.run_polling(drop_pending_updates=True)
 
