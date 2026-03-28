@@ -1,11 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v16.1 — ANTI-BLOCK + CAPTCHA BYPASS   ║
+║   DORK PARSER BOT v16.2 — ANTI-BLOCK + CAPTCHA BYPASS   ║
 ║   Robust HTML parsing | Per-job session | Early dedup   ║
 ║   Watchdog + auto-restart | Global job timeout          ║
 ║   Bounded queues | No deadlocks                         ║
 ║   Pages 1-70 | Tor auto-rotation                       ║
-║   FIXED: queue full handling, self-restart polling     ║
+║   FIXED: zero URLs, event loop crashes                  ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -261,9 +261,12 @@ def _extract_links(html: str) -> list[str]:
         pass
     return p.links
 
+def _extract_links_fallback(html: str) -> list[str]:
+    """Fallback: extract any http/https URL using regex."""
+    return re.findall(r'https?://[^\s"\'<>]+', html)
 
 # ─── SEARCH ENGINE FUNCTIONS ─────────────────────────────────────────────────
-# ═══ PATCHED SECTION: Anti-block + CAPTCHA bypass ════════════════════════════
+# ═══ PATCHED SECTION: Anti-block + CAPTCHA bypass + Fallback extraction ═════
 
 USER_AGENTS = [
     # Chrome Windows
@@ -391,7 +394,17 @@ async def fetch_page_bing(session: aiohttp.ClientSession, dork: str, page: int, 
                 await asyncio.sleep(wait)
                 continue
 
-            raw  = _extract_links(html)
+            # Primary extraction
+            raw = _extract_links(html)
+            if not raw:
+                # Fallback regex
+                raw = _extract_links_fallback(html)
+                if raw:
+                    log.debug(f"[BING] Fallback regex extracted {len(raw)} URLs for page {page}")
+                else:
+                    snippet = html[:500].replace('\n', ' ')
+                    log.warning(f"[BING] No links found on page {page}. HTML snippet: {snippet}")
+
             urls = [u for u in raw if u.startswith("http") and not _BING_NOISE.search(u)]
             return list(dict.fromkeys(urls))[:max_res]
 
@@ -462,7 +475,17 @@ async def fetch_page_yahoo(session: aiohttp.ClientSession, dork: str, page: int,
                 await asyncio.sleep(wait)
                 continue
 
-            raw  = _extract_links(html)
+            # Primary extraction
+            raw = _extract_links(html)
+            if not raw:
+                # Fallback regex
+                raw = _extract_links_fallback(html)
+                if raw:
+                    log.debug(f"[YAHOO] Fallback regex extracted {len(raw)} URLs for page {page}")
+                else:
+                    snippet = html[:500].replace('\n', ' ')
+                    log.warning(f"[YAHOO] No links found on page {page}. HTML snippet: {snippet}")
+
             urls = []
             for u in raw:
                 if not u.startswith("http"):
@@ -525,7 +548,7 @@ async def fetch_all_pages(session: aiohttp.ClientSession, dork: str, engine: str
                 break
 
         if len(sorted_pages) > 1 and page != sorted_pages[-1]:
-            await asyncio.sleep(random.uniform(1.0, 3.0))   # wider = more human
+            await asyncio.sleep(random.uniform(1.0, 3.0))
 
     return all_urls
 
@@ -561,7 +584,6 @@ async def dork_worker(wid: int,
             log.warning(f"[W{wid}] fetch_all_pages timeout after {WORKER_FETCH_TIMEOUT}s: {dork[:55]}")
         except asyncio.CancelledError:
             try:
-                # Use await put with timeout to avoid deadlock
                 await asyncio.wait_for(results_q.put((dork, engine, pages, [], 0)), timeout=10)
             except (asyncio.TimeoutError, asyncio.QueueFull):
                 pass
@@ -574,7 +596,6 @@ async def dork_worker(wid: int,
         log.info(f"[W{wid}] raw={len(raw)} kept={len(scored)}")
 
         try:
-            # Wait up to 30 seconds for space in queue, then skip
             await asyncio.wait_for(results_q.put((dork, engine, pages, scored, len(raw))), timeout=30)
         except asyncio.TimeoutError:
             log.warning(f"[W{wid}] Could not enqueue result for {dork[:55]}, queue full")
@@ -619,7 +640,7 @@ async def run_dork_job(chat_id: int, dorks: list, context):
         prefix=f"dork_{chat_id}_", suffix='.txt'
     )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v16.1 — SQL Targeted Results\n")
+    tmp_file.write(f"# Dork Parser v16.2 — SQL Targeted Results\n")
     tmp_file.write(f"# Date  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     tmp_file.write(f"# Dorks : {total_dorks} | Pages : {pages_str}\n")
     tmp_file.write(f"# Filter: SQL ≥{min_score}\n")
@@ -628,7 +649,7 @@ async def run_dork_job(chat_id: int, dorks: list, context):
 
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v16.1 — STARTED\n"
+        f"🕷 DORK PARSER v16.2 — STARTED\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -904,7 +925,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📖 Help",         callback_data="m_help")],
     ]
     await update.message.reply_text(
-        "🕷 DORK PARSER v16.1 — ANTI-BLOCK EDITION\n"
+        "🕷 DORK PARSER v16.2 — ANTI-BLOCK EDITION\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ Workers | Sequential pages | Stop on 3 empty pages\n"
         "🔁 Auto-restart on stall | Session reset on zero results\n"
@@ -1186,10 +1207,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in replies:
         await query.message.reply_text(replies[data])
 
-# ─── GLOBAL EXCEPTION HANDLER FOR EVENT LOOP ───────────────────────────────
-def handle_loop_exception(loop, context):
-    log.critical(f"Unhandled exception in event loop: {context}", exc_info=context.get("exception"))
-
 # ─── CLEANUP SHARED CONNECTOR ─────────────────────────────────────────────
 async def cleanup_shared_connector():
     global SHARED_CONNECTOR
@@ -1204,7 +1221,7 @@ def main():
         raise SystemExit(1)
 
     log.info("=" * 55)
-    log.info("  DORK PARSER v16.1 — ANTI-BLOCK + CAPTCHA BYPASS")
+    log.info("  DORK PARSER v16.2 — ANTI-BLOCK + CAPTCHA BYPASS")
     log.info("=" * 55)
 
     # Setup app
@@ -1238,7 +1255,6 @@ def main():
     while True:
         try:
             log.info("Starting bot polling...")
-            # run_polling is a synchronous method that blocks until the bot stops
             app.run_polling(drop_pending_updates=True)
         except Exception as e:
             log.critical(f"Polling crashed: {e}", exc_info=True)
