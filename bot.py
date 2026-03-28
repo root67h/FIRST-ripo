@@ -17,6 +17,7 @@ import os
 import time
 import logging
 import tempfile
+import atexit
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -1197,9 +1198,19 @@ async def cleanup_shared_connector():
         log.info("Closed shared connector")
 
 # ─── MAIN WITH SELF-RESTARTING POLLING ─────────────────────────────────────
-async def run_bot():
+def main():
+    if not BOT_TOKEN:
+        log.critical("BOT_TOKEN not set! Add to .env file or environment.")
+        raise SystemExit(1)
+
+    log.info("=" * 55)
+    log.info("  DORK PARSER v16.1 — ANTI-BLOCK + CAPTCHA BYPASS")
+    log.info("=" * 55)
+
+    # Setup app
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Add handlers
     for name, handler in [
         ("start",    cmd_start),
         ("help",     cmd_settings),
@@ -1220,41 +1231,22 @@ async def run_bot():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Set global exception handler
-    loop = asyncio.get_running_loop()
-    loop.set_exception_handler(handle_loop_exception)
-
-    # Register shutdown cleanup
-    app.shutdown_handler = cleanup_shared_connector
+    # Register cleanup on exit
+    atexit.register(lambda: asyncio.run(cleanup_shared_connector()))
 
     # Polling loop with auto-restart
     while True:
         try:
             log.info("Starting bot polling...")
-            await app.run_polling(drop_pending_updates=True)
+            # run_polling is a synchronous method that blocks until the bot stops
+            app.run_polling(drop_pending_updates=True)
         except Exception as e:
             log.critical(f"Polling crashed: {e}", exc_info=True)
             log.info("Restarting in 10 seconds...")
-            await asyncio.sleep(10)
+            time.sleep(10)
         else:
-            # Normal shutdown (e.g., SIGINT)
+            # Normal shutdown (e.g., Ctrl+C)
             break
-
-def main():
-    if not BOT_TOKEN:
-        log.critical("BOT_TOKEN not set! Add to .env file or environment.")
-        raise SystemExit(1)
-
-    log.info("=" * 55)
-    log.info("  DORK PARSER v16.1 — ANTI-BLOCK + CAPTCHA BYPASS")
-    log.info("=" * 55)
-
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        log.info("Shutdown requested")
-        # Clean up shared connector manually
-        asyncio.run(cleanup_shared_connector())
 
 if __name__ == "__main__":
     main()
