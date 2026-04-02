@@ -49,8 +49,8 @@ log = logging.getLogger(__name__)
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 WORKERS     = int(os.environ.get("WORKERS", 20))
-MIN_DELAY   = float(os.environ.get("MIN_DELAY", 0.5))
-MAX_DELAY   = float(os.environ.get("MAX_DELAY", 1.5))
+MIN_DELAY   = float(os.environ.get("MIN_DELAY", 1.5))
+MAX_DELAY   = float(os.environ.get("MAX_DELAY", 3.0))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", 10))
 TOR_PROXY   = os.environ.get("TOR_PROXY", "socks5://127.0.0.1:9050")
 OUTPUT_DIR  = Path("results")
@@ -234,17 +234,6 @@ def _build_headers(engine: str, profile: tuple = None, referer: str = None) -> d
         }
         headers["Referer"] = ref_map.get(engine, "")
 
-    # Chrome Client Hints (only Chrome-based UAs have ch_ua)
-    if ch_ua:
-        headers["Sec-CH-UA"]          = ch_ua
-        headers["Sec-CH-UA-Mobile"]   = is_mobile
-        headers["Sec-CH-UA-Platform"] = f'"{platform}"'
-        headers["Sec-Fetch-Dest"]     = "document"
-        headers["Sec-Fetch-Mode"]     = "navigate"
-        headers["Sec-Fetch-Site"]     = "same-origin" if referer else "none"
-        headers["Sec-Fetch-User"]     = "?1"
-        headers["Cache-Control"]      = "max-age=0"
-
     return headers
 
 
@@ -262,11 +251,9 @@ _BLOCK_RE = re.compile(
 
 
 def is_soft_blocked(html: str, status: int) -> bool:
-    if status in (429, 503, 403):
+    if status in (403, 429, 503):
         return True
-    if len(html) < 400:
-        return True
-    return bool(_BLOCK_RE.search(html[:4000]))
+    return bool(_BLOCK_RE.search(html[:4000]) if html else False)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -304,8 +291,8 @@ VULN_EXTENSIONS = {".php", ".asp", ".aspx", ".cfm", ".jsf", ".do", ".cgi", ".pl"
 
 _JUNK_RE = re.compile(
     r"aclick\?|uservoice\.com|utm_source=|"
-    r"\.pdf$|\.jpg$|\.jpeg$|\.png$|\.gif$|\.webp$|\.avif$|"
-    r"\.svg$|\.ico$|\.css$|\.js$|\.mp4$|\.mp3$|\.zip$|"
+    r"\.pdf\( |\.jpg \)|\.jpeg\( |\.png \)|\.gif\( |\.webp \)|\.avif$|"
+    r"\.svg\( |\.ico \)|\.css\( |\.js \)|\.mp4\( |\.mp3 \)|\.zip$|"
     r"/static/|/assets/|/images/|/img/|/fonts/|/media/|/cdn-cgi/|"
     r"/wp-content/uploads/",
     re.IGNORECASE,
@@ -379,48 +366,25 @@ def _domain_key(url: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-#  ROBUST HTML LINK EXTRACTOR  (unchanged)
+#  REGEX LINK EXTRACTOR (restored)
 # ═══════════════════════════════════════════════════════════
-class _LinkExtractor(HTMLParser):
-    __slots__ = ("links", "_in_cite", "_buf")
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.links: list[str] = []
-        self._in_cite = False
-        self._buf: list = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag == "a":
-            adict = dict(attrs)
-            for key in ("href", "data-u"):
-                val = adict.get(key, "")
-                if val.startswith("http"):
-                    self.links.append(val)
-        elif tag == "cite":
-            self._in_cite = True
-            self._buf.clear()
-
-    def handle_endtag(self, tag):
-        if tag == "cite" and self._in_cite:
-            text = "".join(self._buf).strip()
-            if text.startswith("http"):
-                self.links.append(text)
-            self._in_cite = False
-            self._buf.clear()
-
-    def handle_data(self, data):
-        if self._in_cite:
-            self._buf.append(data)
-
+_LINK_RE = re.compile(r'(?i)href=["\']?(https?://[^"\'>]+)|https?://[^\s<>"\']+|/RU=([^"&]+)', re.IGNORECASE)
 
 def _extract_links(html: str) -> list[str]:
-    p = _LinkExtractor()
-    try:
-        p.feed(html)
-    except Exception:
-        pass
-    return p.links
+    """Regex-based extractor (restored) — supports href, raw URLs, Bing/Yahoo redirects."""
+    if not html:
+        return []
+    links = []
+    for m in _LINK_RE.finditer(html):
+        url = m.group(1) or m.group(0)
+        if m.group(2):  # Yahoo /RU= redirect
+            try:
+                url = unquote(m.group(2))
+            except Exception:
+                continue
+        if url.startswith(('http://', 'https://')):
+            links.append(url)
+    return list(dict.fromkeys(links))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -512,7 +476,7 @@ def _make_job_sessions(use_tor: bool, engines: list) -> dict:
 # ═══════════════════════════════════════════════════════════
 #  FETCH HELPERS — retry + backoff + CH-UA + referer
 # ═══════════════════════════════════════════════════════════
-_BING_NOISE  = re.compile(r"bing\.com", re.IGNORECASE)
+_BING_NOISE  = re.compile(r"bing\.com/(search|fd|aclick|rs|ad|partner)|bing\.com.*(utm|clid|msclkid)", re.IGNORECASE)
 _YAHOO_NOISE = re.compile(r"yimg\.com|yahoo\.com|doubleclick\.net|googleadservices", re.IGNORECASE)
 _DDG_NOISE   = re.compile(r"duckduckgo\.com", re.IGNORECASE)
 _STATIC_EXT  = re.compile(r"\.(css|js|png|jpg|jpeg|gif|svg|ico|webp|woff2?|ttf|eot)(\?|$)", re.IGNORECASE)
@@ -679,7 +643,7 @@ async def fetch_page_ddg(session: aiohttp.ClientSession,
 
 
 # ═══════════════════════════════════════════════════════════
-#  PARALLEL PAGE FETCHER  (asyncio.gather + per-engine sem)
+#  SEQUENTIAL PAGE FETCHER
 # ═══════════════════════════════════════════════════════════
 _FETCH_FN = {
     "bing":  fetch_page_bing,
@@ -692,23 +656,17 @@ async def fetch_all_pages(session: aiohttp.ClientSession,
                           dork: str, engine: str,
                           pages: list, max_res: int,
                           sem: asyncio.Semaphore) -> list:
-    """Fetch all pages CONCURRENTLY, bounded by sem. Returns flat URL list."""
+    """SEQUENTIAL page fetching (replaces asyncio.gather) to prevent detection."""
     fn = _FETCH_FN[engine]
-
-    async def _one(page: int) -> list:
+    merged = []
+    for page in sorted(pages):
         async with sem:
             urls, blocked = await fn(session, dork, page, max_res)
             if blocked:
-                return []
-            await asyncio.sleep(_human_delay(0.35, 0.12))
-            return urls
-
-    tasks   = [asyncio.create_task(_one(p)) for p in sorted(pages)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    merged  = []
-    for r in results:
-        if isinstance(r, list):
-            merged.extend(r)
+                log.warning(f"[{engine.upper()}] Soft-blocked on page {page}")
+                break
+            merged.extend(urls)
+        await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
     return list(dict.fromkeys(merged))
 
 
@@ -1450,7 +1408,7 @@ def main():
         app.add_handler(CommandHandler(name, handler))
 
     app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     log.info("=" * 55)
