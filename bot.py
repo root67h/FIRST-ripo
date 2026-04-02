@@ -57,9 +57,9 @@ ENGINES   = ["bing", "yahoo"]
 MAX_PAGES = 70
 
 # ─── RELIABILITY CONSTANTS ──────────────────────────────────────────────────
-WORKER_FETCH_TIMEOUT = 120          # seconds per multi-page fetch
+WORKER_FETCH_TIMEOUT = 180          # seconds per multi-page fetch
 WATCHDOG_INTERVAL    = 30           # seconds between watchdog checks
-WATCHDOG_STALL_LIMIT = 90           # seconds without result before restart
+WATCHDOG_STALL_LIMIT = 120           # seconds without result before restart
 SESSION_RESET_THRESHOLD = 8         # consecutive zero-raw dorks before session recycle
 JOB_TIMEOUT          = 30 * 60      # 30 minutes total job runtime
 
