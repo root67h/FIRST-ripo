@@ -1408,7 +1408,7 @@ def main():
         app.add_handler(CommandHandler(name, handler))
 
     app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
-    # FIXED LINE — removed accidental backslash before \~
+    # FIXED: Correct syntax — no backslash before \~
     app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
