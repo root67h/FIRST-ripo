@@ -949,9 +949,10 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     timeout_task = asyncio.create_task(_job_timeout())
 
     # ── Launch all chunks (staggered to prevent synchronised bursts) ──────────
-    chunk_results = []
+    chunk_tasks = []          # defined early for cancellation safety
+    chunk_results = None
+    cancelled = False
     try:
-        chunk_tasks = []
         for i, chunk_dorks in enumerate(chunks):
             if i > 0:
                 stagger = random.uniform(*CHUNK_STAGGER_DELAY)
@@ -977,12 +978,17 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
 
     except asyncio.CancelledError:
-        log.info(f"[JOB][{chat_id}] Job cancelled")
+        log.info(f"[JOB][{chat_id}] STOP requested — saving partial results")
+        cancelled = True
         global_stop_ev.set()
         for t in chunk_tasks:
             t.cancel()
-        await asyncio.gather(*chunk_tasks, return_exceptions=True)
-        raise
+        # Gather partial results from chunks that may have already completed
+        if chunk_tasks:
+            chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+        else:
+            chunk_results = []
+        # Do NOT re-raise – continue to merging and output
     finally:
         global_stop_ev.set()
         timeout_task.cancel()
@@ -997,7 +1003,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     total_degraded   = 0
     failed_chunks    = 0
 
-    for result in chunk_results:
+    for result in (chunk_results or []):
         if isinstance(result, Exception):
             log.error(f"[JOB][{chat_id}] Chunk raised: {result}")
             failed_chunks += 1
@@ -1022,6 +1028,9 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     )
 
     # ── Write scored output ───────────────────────────────────────────────────
+    if cancelled:
+        await context.bot.send_message(chat_id, "⚠️ Job stopped early — partial results saved.")
+
     high   = [(sc, u) for sc, u in all_scored if sc >= 70]
     medium = [(sc, u) for sc, u in all_scored if 40 <= sc < 70]
     low    = [(sc, u) for sc, u in all_scored if sc < 40]
@@ -1498,4 +1507,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
