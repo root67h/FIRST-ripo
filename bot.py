@@ -1,11 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v17.0 — PARALLEL CHUNK ARCHITECTURE   ║
+║   DORK PARSER BOT v17.1 — PARTIAL RESULTS ON STOP       ║
 ║   N isolated sessions | Per-chunk worker pools          ║
 ║   Retry + exponential backoff | Degraded HTML detection  ║
 ║   Auto-slowdown on empty rate | Global dedup + merge     ║
 ║   Bounded queues | Staggered chunk starts                ║
-║   Pages 1-70 | Tor auto-rotation                        ║
+║   Pages 1-70 | Tor auto-rotation | /stop saves partial  ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -822,6 +822,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
       4. Aggregates progress and updates Telegram status in real-time.
       5. Globally deduplicates and merges all chunk results.
       6. Writes a scored output file and sends it to the user.
+      7. On cancellation (/stop), sends partial results.
     """
     sess      = get_session(chat_id)
     engines   = sess.get("engines", list(ENGINES))
@@ -853,7 +854,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         prefix=f"dork_{chat_id}_", suffix=".txt",
     )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v17.0 — SQL Targeted Results\n")
+    tmp_file.write(f"# Dork Parser v17.1 — SQL Targeted Results (Partial on Stop)\n")
     tmp_file.write(f"# Date   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     tmp_file.write(f"# Dorks  : {total_dorks} | Pages: {pages_str}\n")
     tmp_file.write(f"# Filter : SQL ≥{min_score} | Chunks: {actual_chunks}\n")
@@ -863,7 +864,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     # ── Initial status message ────────────────────────────────────────────────
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v17.0 — STARTED\n"
+        f"🕷 DORK PARSER v17.1 — STARTED\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -949,9 +950,8 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     timeout_task = asyncio.create_task(_job_timeout())
 
     # ── Launch all chunks (staggered to prevent synchronised bursts) ──────────
-    chunk_tasks = []          # defined early for cancellation safety
-    chunk_results = None
-    cancelled = False
+    chunk_tasks = []
+    chunk_results = []  # will hold completed results even on cancel
     try:
         for i, chunk_dorks in enumerate(chunks):
             if i > 0:
@@ -975,37 +975,46 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             )
             chunk_tasks.append(task)
 
+        # Gather results, allowing cancellation
         chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
 
     except asyncio.CancelledError:
-        log.info(f"[JOB][{chat_id}] STOP requested — saving partial results")
-        cancelled = True
+        log.info(f"[JOB][{chat_id}] Job cancelled – collecting partial results")
+        # Cancel any remaining chunks and wait for them to finish gracefully
         global_stop_ev.set()
         for t in chunk_tasks:
-            t.cancel()
-        # Gather partial results from chunks that may have already completed
-        if chunk_tasks:
-            chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-        else:
-            chunk_results = []
-        # Do NOT re-raise – continue to merging and output
+            if not t.done():
+                t.cancel()
+        # Wait for all tasks to complete (with exceptions)
+        partial_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+        # Combine already finished results (if any) with partial ones
+        chunk_results = []
+        for res in partial_results:
+            if isinstance(res, Exception):
+                if isinstance(res, asyncio.CancelledError):
+                    continue
+                log.error(f"[JOB][{chat_id}] Chunk raised: {res}")
+            else:
+                chunk_results.append(res)
+        # Also add any results that were already collected before cancellation?
+        # The gather above already returns all results (finished or cancelled).
+        # So we just use chunk_results = partial_results filtered.
     finally:
         global_stop_ev.set()
         timeout_task.cancel()
         status_task.cancel()
         await asyncio.gather(timeout_task, status_task, return_exceptions=True)
-        active_jobs.pop(chat_id, None)
 
-    # ── Merge + global deduplication ─────────────────────────────────────────
+    # ── Merge + global deduplication (works for both full and partial runs) ───
     seen_urls   : set  = set()
     all_scored  : list = []
     total_raw        = 0
     total_degraded   = 0
     failed_chunks    = 0
 
-    for result in (chunk_results or []):
+    for result in chunk_results:
         if isinstance(result, Exception):
-            log.error(f"[JOB][{chat_id}] Chunk raised: {result}")
+            log.error(f"[JOB][{chat_id}] Chunk error: {result}")
             failed_chunks += 1
             continue
         for sc, url in result["scored"]:
@@ -1021,16 +1030,14 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     success_rate = (total_raw - (total_raw - unique_cnt)) / max(total_raw, 1)
 
     log.info(
-        f"[JOB][{chat_id}] COMPLETE — dorks={total_dorks} raw={total_raw} "
+        f"[JOB][{chat_id}] {'PARTIAL' if global_stop_ev.is_set() else 'COMPLETE'} — "
+        f"dorks={total_dorks} raw={total_raw} "
         f"unique={unique_cnt} degraded={total_degraded} "
         f"failed_chunks={failed_chunks} elapsed={elapsed}s "
         f"success_rate={success_rate:.1%}"
     )
 
-    # ── Write scored output ───────────────────────────────────────────────────
-    if cancelled:
-        await context.bot.send_message(chat_id, "⚠️ Job stopped early — partial results saved.")
-
+    # ── Write scored output (partial or full) ─────────────────────────────────
     high   = [(sc, u) for sc, u in all_scored if sc >= 70]
     medium = [(sc, u) for sc, u in all_scored if 40 <= sc < 70]
     low    = [(sc, u) for sc, u in all_scored if sc < 40]
@@ -1049,13 +1056,18 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             for sc, u in low:
                 f.write(f"{u}\n")
 
-    # ── Final status message ──────────────────────────────────────────────────
+    # ── Final status message (depending on cancellation) ──────────────────────
+    if global_stop_ev.is_set():
+        final_title = "🛑 JOB STOPPED (Partial Results)"
+    else:
+        final_title = "🏁 JOB COMPLETE!"
+
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=status_msg.message_id,
             text=(
-                f"🏁 JOB COMPLETE!\n"
+                f"{final_title}\n"
                 f"{'━'*30}\n"
                 f"📋 Dorks    : {total_dorks}\n"
                 f"📄 Pages    : {pages_str}\n"
@@ -1078,7 +1090,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                 chat_id, f,
                 filename=f"sql_{total_dorks}dorks_{unique_cnt}urls.txt",
                 caption=(
-                    f"📁 SQL Targets\n"
+                    f"📁 SQL Targets {'(partial)' if global_stop_ev.is_set() else ''}\n"
                     f"🎯 {unique_cnt} unique | 🗑 {total_raw - unique_cnt} junk\n"
                     f"📋 {total_dorks} dorks | Pages: {pages_str} | "
                     f"⚡ {actual_chunks} chunks"
@@ -1095,6 +1107,9 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         os.unlink(tmp_path)
     except OSError:
         pass
+
+    # Finally remove job from active list
+    active_jobs.pop(chat_id, None)
 
 
 # ─── UI HELPERS ────────────────────────────────────────────────────────────
@@ -1136,13 +1151,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📖 Help",         callback_data="m_help")],
     ]
     await update.message.reply_text(
-        "🕷 DORK PARSER v17.0 — PARALLEL CHUNKS\n"
+        "🕷 DORK PARSER v17.1 — PARALLEL CHUNKS + PARTIAL RESULTS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ N isolated sessions | Per-chunk worker pools\n"
         "🔁 Retry + backoff | Degraded HTML detection\n"
         "🛡 SQL filter | Auto-slowdown on empty rate\n"
         "🧅 Tor auto-rotation every 2 minutes\n"
-        "⏱️ Global job timeout: 30 min\n\n"
+        "⏱️ Global job timeout: 30 min\n"
+        "🛑 /stop saves partial results immediately!\n\n"
         "📌 Commands:\n"
         "  /dork <q>   — single dork\n"
         "  /pages      — pick pages 1-70\n"
@@ -1306,12 +1322,15 @@ async def cmd_engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if chat_id in active_jobs:
-        task = active_jobs.pop(chat_id)
-        task.cancel()
-        await update.message.reply_text("🛑 Stopping... Partial results will be sent shortly.")
+    job = active_jobs.get(chat_id)
+    if job and not job.done():
+        job.cancel()
+        await update.message.reply_text(
+            "🛑 Stopping job... Partial results will be collected and sent shortly.\n"
+            "This may take a few seconds."
+        )
     else:
-        await update.message.reply_text("No active job.")
+        await update.message.reply_text("No active job to stop.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1445,7 +1464,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/settings   — full config\n"
             "/maxres N   — results/page (1-50)\n"
             "/engine X   — bing|yahoo|both\n"
-            "/stop       — stop job\n"
+            "/stop       — stop job and get partial results\n"
             "/status     — job status\n"
             "━━━━━━━━━━━━━━━━━━━\n"
             "Upload .txt for unlimited bulk!\n\n"
@@ -1498,7 +1517,7 @@ def main():
     app.shutdown_handler = _shutdown
 
     log.info("=" * 55)
-    log.info("  DORK PARSER v17.0 — PARALLEL CHUNK ARCHITECTURE")
+    log.info("  DORK PARSER v17.1 — PARALLEL CHUNK + PARTIAL RESULTS")
     log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK}")
     log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s | Retries: {MAX_RETRIES}")
     log.info("=" * 55)
