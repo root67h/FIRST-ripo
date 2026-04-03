@@ -1,11 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v17.2 — PARTIAL RESULTS ON /stop      ║
+║   DORK PARSER BOT v17.0 — PARALLEL CHUNK ARCHITECTURE   ║
 ║   N isolated sessions | Per-chunk worker pools          ║
 ║   Retry + exponential backoff | Degraded HTML detection  ║
 ║   Auto-slowdown on empty rate | Global dedup + merge     ║
 ║   Bounded queues | Staggered chunk starts                ║
-║   Pages 1-70 | Tor auto-rotation | /stop saves partial  ║
+║   Pages 1-70 | Tor auto-rotation                        ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -812,54 +812,58 @@ async def run_chunk(
     }
 
 
-# ─── JOB RUNNER (FIXED FOR PARTIAL RESULTS ON /stop) ─────────────────────────
+# ─── JOB RUNNER ──────────────────────────────────────────────────────────────
 async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     """
     Orchestrates the full job:
       1. Splits dorks into N isolated chunks.
-      2. Stagger-starts each chunk.
-      3. Runs all chunks concurrently.
-      4. On /stop, sets global stop flag and waits for chunks to finish gracefully.
-      5. Sends partial results immediately.
+      2. Stagger-starts each chunk to avoid synchronised bursts.
+      3. Runs all chunks concurrently via asyncio.gather.
+      4. Aggregates progress and updates Telegram status in real-time.
+      5. Globally deduplicates and merges all chunk results.
+      6. Writes a scored output file and sends it to the user.
     """
-    sess = get_session(chat_id)
-    engines = sess.get("engines", list(ENGINES))
+    sess      = get_session(chat_id)
+    engines   = sess.get("engines", list(ENGINES))
     workers_n = min(sess.get("workers", WORKERS_PER_CHUNK), MAX_WORKERS_PER_CHUNK)
-    max_res = sess.get("max_results", MAX_RESULTS)
-    pages = sess.get("pages", [1])
-    use_tor = sess.get("tor", False)
+    max_res   = sess.get("max_results", MAX_RESULTS)
+    pages     = sess.get("pages", [1])
+    use_tor   = sess.get("tor", False)
     min_score = sess.get("min_score", 30)
-    n_chunks = max(1, sess.get("chunks", N_CHUNKS))
+    n_chunks  = max(1, sess.get("chunks", N_CHUNKS))
 
     total_dorks = len(dorks)
-    pages_str = ", ".join(str(p) for p in pages)
-    start_time = time.time()
+    pages_str   = ", ".join(str(p) for p in pages)
+    start_time  = time.time()
 
-    # Split dorks into balanced chunks
-    chunk_size = max(1, -(-total_dorks // n_chunks))
-    chunks = [dorks[i:i + chunk_size] for i in range(0, total_dorks, chunk_size)]
+    # ── Split dorks into balanced chunks ─────────────────────────────────────
+    chunk_size    = max(1, -(-total_dorks // n_chunks))  # ceiling division
+    chunks        = [dorks[i : i + chunk_size] for i in range(0, total_dorks, chunk_size)]
     actual_chunks = len(chunks)
 
-    log.info(f"[JOB][{chat_id}] Starting: {total_dorks} dorks → "
-             f"{actual_chunks} chunks × {workers_n} workers/chunk")
+    log.info(
+        f"[JOB][{chat_id}] Starting: {total_dorks} dorks → "
+        f"{actual_chunks} chunks × {workers_n} workers/chunk | "
+        f"delay={MIN_DELAY}–{MAX_DELAY}s"
+    )
 
-    # Temporary output file
+    # ── Temporary output file ─────────────────────────────────────────────────
     tmp_file = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", delete=False,
         prefix=f"dork_{chat_id}_", suffix=".txt",
     )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v17.2 — SQL Targeted Results (Partial on Stop)\n")
+    tmp_file.write(f"# Dork Parser v17.0 — SQL Targeted Results\n")
     tmp_file.write(f"# Date   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     tmp_file.write(f"# Dorks  : {total_dorks} | Pages: {pages_str}\n")
     tmp_file.write(f"# Filter : SQL ≥{min_score} | Chunks: {actual_chunks}\n")
     tmp_file.write("─" * 60 + "\n\n")
     tmp_file.close()
 
-    # Initial status message
+    # ── Initial status message ────────────────────────────────────────────────
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v17.2 — STARTED\n"
+        f"🕷 DORK PARSER v17.0 — STARTED\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -871,35 +875,44 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         f"{'━'*30}\n⏳ Starting chunks...",
     )
 
-    # Shared state
+    # ── Shared state ──────────────────────────────────────────────────────────
     global_stop_ev = asyncio.Event()
     progress_q: asyncio.Queue = asyncio.Queue(maxsize=total_dorks * 2)
-    chunk_counters = {i: {"processed": 0, "total": len(chunks[i])} for i in range(actual_chunks)}
-    agg_raw = [0]
+
+    # Per-chunk counters for the live status bar
+    chunk_counters = {
+        i: {"processed": 0, "total": len(chunks[i])}
+        for i in range(actual_chunks)
+    }
+    agg_raw  = [0]
     agg_kept = [0]
+
+    # ── Live status updater ───────────────────────────────────────────────────
     last_edit = [0.0]
     total_processed = [0]
 
-    async def _status_updater():
+    async def _status_updater() -> None:
         while not global_stop_ev.is_set():
+            # Drain all pending progress events
             drained = False
             while True:
                 try:
                     ev = progress_q.get_nowait()
                     cid = ev["chunk_id"]
                     chunk_counters[cid]["processed"] = ev["processed"]
-                    agg_raw[0] += ev["raw"]
+                    agg_raw[0]  += ev["raw"]
                     agg_kept[0] += ev["kept"]
                     total_processed[0] += 1
                     drained = True
                 except asyncio.QueueEmpty:
                     break
+
             if drained and time.time() - last_edit[0] > 4.0:
                 proc = total_processed[0]
-                pct = int(proc / total_dorks * 100) if total_dorks else 100
-                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                pct  = int(proc / total_dorks * 100) if total_dorks else 100
+                bar  = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 elapsed = int(time.time() - start_time)
-                eta = int((elapsed / proc) * (total_dorks - proc)) if proc else 0
+                eta  = int((elapsed / proc) * (total_dorks - proc)) if proc else 0
                 cinfo = " | ".join(
                     f"C{i}:{chunk_counters[i]['processed']}/{chunk_counters[i]['total']}"
                     for i in range(actual_chunks)
@@ -923,98 +936,95 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                     last_edit[0] = time.time()
                 except Exception:
                     pass
+
             await asyncio.sleep(0.5)
 
-    async def _job_timeout():
+    # ── Global timeout ────────────────────────────────────────────────────────
+    async def _job_timeout() -> None:
         await asyncio.sleep(JOB_TIMEOUT)
         log.warning(f"[JOB][{chat_id}] Global timeout ({JOB_TIMEOUT}s) — aborting")
         global_stop_ev.set()
 
-    status_task = asyncio.create_task(_status_updater())
+    status_task  = asyncio.create_task(_status_updater())
     timeout_task = asyncio.create_task(_job_timeout())
 
-    # Start chunks with staggered delays
-    chunk_tasks = []
-    for i, chunk_dorks in enumerate(chunks):
-        if i > 0:
-            stagger = random.uniform(*CHUNK_STAGGER_DELAY)
-            log.info(f"[JOB][{chat_id}] Staggering chunk C{i} by {stagger:.1f}s")
-            await asyncio.sleep(stagger)
-        task = asyncio.create_task(
-            run_chunk(
-                chunk_id=i,
-                dorks=chunk_dorks,
-                engines=engines,
-                pages=pages,
-                max_res=max_res,
-                use_tor=use_tor,
-                min_score=min_score,
-                workers_n=workers_n,
-                progress_q=progress_q,
-                global_stop_ev=global_stop_ev,
-            )
-        )
-        chunk_tasks.append(task)
-
-    # Wait for all chunks to finish OR be stopped gracefully
+    # ── Launch all chunks (staggered to prevent synchronised bursts) ──────────
     chunk_results = []
     try:
-        # Wait normally – if cancelled, we'll handle it below without cancelling chunks
-        chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-    except asyncio.CancelledError:
-        log.info(f"[JOB][{chat_id}] Stop signal received – waiting for chunks to finish gracefully")
-        global_stop_ev.set()          # tell all chunks to stop
-        # Wait for chunks to complete (they will exit cleanly because stop_ev is set)
-        # Use a timeout to avoid hanging forever (max 10 seconds)
-        try:
-            chunk_results = await asyncio.wait_for(
-                asyncio.gather(*chunk_tasks, return_exceptions=True),
-                timeout=10.0
+        chunk_tasks = []
+        for i, chunk_dorks in enumerate(chunks):
+            if i > 0:
+                stagger = random.uniform(*CHUNK_STAGGER_DELAY)
+                log.info(f"[JOB][{chat_id}] Staggering chunk C{i} by {stagger:.1f}s")
+                await asyncio.sleep(stagger)
+
+            task = asyncio.create_task(
+                run_chunk(
+                    chunk_id=i,
+                    dorks=chunk_dorks,
+                    engines=engines,
+                    pages=pages,
+                    max_res=max_res,
+                    use_tor=use_tor,
+                    min_score=min_score,
+                    workers_n=workers_n,
+                    progress_q=progress_q,
+                    global_stop_ev=global_stop_ev,
+                )
             )
-        except asyncio.TimeoutError:
-            log.warning(f"[JOB][{chat_id}] Some chunks did not finish within 10s – forcing cancel")
-            for t in chunk_tasks:
-                t.cancel()
-            chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-        # Re-raise CancelledError so the job is marked as stopped, but we still have partial results
-        # (we will process them below)
+            chunk_tasks.append(task)
 
-    # Cancel timeout and status updater
-    timeout_task.cancel()
-    status_task.cancel()
-    await asyncio.gather(timeout_task, status_task, return_exceptions=True)
+        chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
 
-    # Merge results from all chunks (including partial ones)
-    seen_urls = set()
-    all_scored = []
-    total_raw = 0
-    total_degraded = 0
-    failed_chunks = 0
+    except asyncio.CancelledError:
+        log.info(f"[JOB][{chat_id}] Job cancelled")
+        global_stop_ev.set()
+        for t in chunk_tasks:
+            t.cancel()
+        await asyncio.gather(*chunk_tasks, return_exceptions=True)
+        raise
+    finally:
+        global_stop_ev.set()
+        timeout_task.cancel()
+        status_task.cancel()
+        await asyncio.gather(timeout_task, status_task, return_exceptions=True)
+        active_jobs.pop(chat_id, None)
+
+    # ── Merge + global deduplication ─────────────────────────────────────────
+    seen_urls   : set  = set()
+    all_scored  : list = []
+    total_raw        = 0
+    total_degraded   = 0
+    failed_chunks    = 0
 
     for result in chunk_results:
         if isinstance(result, Exception):
-            log.error(f"[JOB][{chat_id}] Chunk error: {result}")
+            log.error(f"[JOB][{chat_id}] Chunk raised: {result}")
             failed_chunks += 1
             continue
         for sc, url in result["scored"]:
             if url not in seen_urls:
                 seen_urls.add(url)
                 all_scored.append((sc, url))
-        total_raw += result["raw_count"]
+        total_raw      += result["raw_count"]
         total_degraded += result["degraded_count"]
 
     all_scored.sort(reverse=True)
-    unique_cnt = len(all_scored)
-    elapsed = int(time.time() - start_time)
+    unique_cnt   = len(all_scored)
+    elapsed      = int(time.time() - start_time)
     success_rate = (total_raw - (total_raw - unique_cnt)) / max(total_raw, 1)
 
-    log.info(f"[JOB][{chat_id}] {'PARTIAL' if global_stop_ev.is_set() else 'COMPLETE'} — "
-             f"dorks={total_dorks} raw={total_raw} unique={unique_cnt}")
+    log.info(
+        f"[JOB][{chat_id}] COMPLETE — dorks={total_dorks} raw={total_raw} "
+        f"unique={unique_cnt} degraded={total_degraded} "
+        f"failed_chunks={failed_chunks} elapsed={elapsed}s "
+        f"success_rate={success_rate:.1%}"
+    )
 
-    # Write output file
-    high = [(sc, u) for sc, u in all_scored if sc >= 70]
+    # ── Write scored output ───────────────────────────────────────────────────
+    high   = [(sc, u) for sc, u in all_scored if sc >= 70]
     medium = [(sc, u) for sc, u in all_scored if 40 <= sc < 70]
-    low = [(sc, u) for sc, u in all_scored if sc < 40]
+    low    = [(sc, u) for sc, u in all_scored if sc < 40]
 
     with open(tmp_path, "a", encoding="utf-8") as f:
         if high:
@@ -1030,14 +1040,13 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             for sc, u in low:
                 f.write(f"{u}\n")
 
-    # Send final message and file
-    final_title = "🛑 JOB STOPPED (Partial Results)" if global_stop_ev.is_set() else "🏁 JOB COMPLETE!"
+    # ── Final status message ──────────────────────────────────────────────────
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=status_msg.message_id,
             text=(
-                f"{final_title}\n"
+                f"🏁 JOB COMPLETE!\n"
                 f"{'━'*30}\n"
                 f"📋 Dorks    : {total_dorks}\n"
                 f"📄 Pages    : {pages_str}\n"
@@ -1060,7 +1069,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                 chat_id, f,
                 filename=f"sql_{total_dorks}dorks_{unique_cnt}urls.txt",
                 caption=(
-                    f"📁 SQL Targets {'(partial)' if global_stop_ev.is_set() else ''}\n"
+                    f"📁 SQL Targets\n"
                     f"🎯 {unique_cnt} unique | 🗑 {total_raw - unique_cnt} junk\n"
                     f"📋 {total_dorks} dorks | Pages: {pages_str} | "
                     f"⚡ {actual_chunks} chunks"
@@ -1077,9 +1086,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         os.unlink(tmp_path)
     except OSError:
         pass
-
-    # Remove job from active list
-    active_jobs.pop(chat_id, None)
 
 
 # ─── UI HELPERS ────────────────────────────────────────────────────────────
@@ -1121,14 +1127,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📖 Help",         callback_data="m_help")],
     ]
     await update.message.reply_text(
-        "🕷 DORK PARSER v17.2 — PARALLEL CHUNKS + PARTIAL RESULTS\n"
+        "🕷 DORK PARSER v17.0 — PARALLEL CHUNKS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ N isolated sessions | Per-chunk worker pools\n"
         "🔁 Retry + backoff | Degraded HTML detection\n"
         "🛡 SQL filter | Auto-slowdown on empty rate\n"
         "🧅 Tor auto-rotation every 2 minutes\n"
-        "⏱️ Global job timeout: 30 min\n"
-        "🛑 /stop saves partial results immediately!\n\n"
+        "⏱️ Global job timeout: 30 min\n\n"
         "📌 Commands:\n"
         "  /dork <q>   — single dork\n"
         "  /pages      — pick pages 1-70\n"
@@ -1292,15 +1297,12 @@ async def cmd_engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    job = active_jobs.get(chat_id)
-    if job and not job.done():
-        job.cancel()
-        await update.message.reply_text(
-            "🛑 Stopping job... Partial results will be collected and sent shortly.\n"
-            "This may take a few seconds."
-        )
+    if chat_id in active_jobs:
+        task = active_jobs.pop(chat_id)
+        task.cancel()
+        await update.message.reply_text("🛑 Stopping... Partial results will be sent shortly.")
     else:
-        await update.message.reply_text("No active job to stop.")
+        await update.message.reply_text("No active job.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1434,7 +1436,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/settings   — full config\n"
             "/maxres N   — results/page (1-50)\n"
             "/engine X   — bing|yahoo|both\n"
-            "/stop       — stop job and get partial results\n"
+            "/stop       — stop job\n"
             "/status     — job status\n"
             "━━━━━━━━━━━━━━━━━━━\n"
             "Upload .txt for unlimited bulk!\n\n"
@@ -1487,7 +1489,7 @@ def main():
     app.shutdown_handler = _shutdown
 
     log.info("=" * 55)
-    log.info("  DORK PARSER v17.2 — PARALLEL CHUNK + PARTIAL RESULTS")
+    log.info("  DORK PARSER v17.0 — PARALLEL CHUNK ARCHITECTURE")
     log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK}")
     log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s | Retries: {MAX_RETRIES}")
     log.info("=" * 55)
@@ -1496,3 +1498,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
